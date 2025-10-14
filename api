@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+import argparse
+from requests_oauthlib import OAuth1
+
+TOKENS_PER_API = 4  # consumer_key, consumer_secret, access_token, access_secret
+
+
+def split_into_groups(items, group_size):
+    """Split a flat list into equal-sized chunks."""
+    return [items[pos:pos + group_size] for pos in range(0, len(items), group_size)]
+
+
+def parse_cli_arguments():
+    parser = argparse.ArgumentParser(description="Parse API credentials and configuration.")
+    parser.add_argument("system_name")
+    parser.add_argument("api_urls", help="Comma-separated API URLs")
+    parser.add_argument("api_tokens", help="Comma-separated credentials (4 per API)")
+    parser.add_argument("refresh_mode")
+    parser.add_argument("refresh_token")
+    parser.add_argument("token_url")
+    parser.add_argument("db_table")
+    return parser.parse_args()
+
+
+def build_api_config(arguments):
+    api_urls = [url.strip() for url in arguments.api_urls.split(",") if url.strip()]
+    flat_tokens = [token.strip() for token in arguments.api_tokens.split(",") if token.strip()]
+
+    if len(flat_tokens) != len(api_urls) * TOKENS_PER_API:
+        raise ValueError(f"Expected {TOKENS_PER_API} tokens per API, "
+                         f"got {len(flat_tokens)} for {len(api_urls)} URLs.")
+
+    grouped_tokens = split_into_groups(flat_tokens, TOKENS_PER_API)
+
+    api_configs = []
+    for api_url, token_group in zip(api_urls, grouped_tokens):
+        consumer_key, consumer_secret, access_token, access_secret = token_group
+
+        oauth_session = OAuth1(
+            consumer_key,
+            consumer_secret,
+            access_token,
+            access_secret
+        )
+
+        api_configs.append({
+            "url": api_url,
+            "auth": oauth_session
+        })
+
+    return {
+        "system_name": arguments.system_name,
+        "refresh_mode": arguments.refresh_mode,
+        "refresh_token": arguments.refresh_token,
+        "token_url": arguments.token_url,
+        "db_table": arguments.db_table,
+        "apis": api_configs
+    }
+
+
+def main():
+    args = parse_cli_arguments()
+    config = build_api_config(args)
+
+    print(f"System: {config['system_name']}")
+    print(f"APIs loaded: {len(config['apis'])}")
+    print(f"Target table: {config['db_table']}")
+    for api in config["apis"]:
+        print(f"- {api['url']} (OAuth1 session ready)")
+
+
+if __name__ == "__main__":
+    main()
