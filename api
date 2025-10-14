@@ -71,3 +71,76 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+#!/usr/bin/env python3
+from requests_oauthlib import OAuth1
+import requests
+
+TOKENS_PER_API = 4  # consumer_key, consumer_secret, access_token, access_secret
+
+
+def split_into_groups(items, group_size):
+    """Split a flat list into equal-sized chunks."""
+    return [items[pos:pos + group_size] for pos in range(0, len(items), group_size)]
+
+
+def build_api_config(api_urls: str, api_tokens: str):
+    """
+    Build API configuration with OAuth1 sessions.
+
+    Args:
+        api_urls: Comma-separated API URLs (e.g. "url1,url2")
+        api_tokens: Comma-separated tokens (4 per API)
+                    (consumer_key,consumer_secret,access_token,access_secret,...)
+
+    Returns:
+        List of dictionaries with 'url' and 'auth' (OAuth1 session).
+    """
+    urls = [url.strip() for url in api_urls.split(",") if url.strip()]
+    tokens = [token.strip() for token in api_tokens.split(",") if token.strip()]
+
+    if len(tokens) != len(urls) * TOKENS_PER_API:
+        raise ValueError(f"Expected {TOKENS_PER_API} tokens per API; "
+                         f"got {len(tokens)} for {len(urls)} URLs.")
+
+    token_groups = split_into_groups(tokens, TOKENS_PER_API)
+
+    api_configs = []
+    for api_url, credentials in zip(urls, token_groups):
+        consumer_key, consumer_secret, access_token, access_secret = credentials
+        oauth_session = OAuth1(
+            consumer_key,
+            consumer_secret,
+            access_token,
+            access_secret
+        )
+        api_configs.append({
+            "url": api_url,
+            "auth": oauth_session
+        })
+
+    return api_configs
+
+
+def main():
+    """
+    Main entry: builds API configs and authenticates with OAuth1.
+    (Replace static values with arguments, env vars, or config file as needed.)
+    """
+    api_urls = "https://api.a.com,https://api.b.com"
+    api_tokens = "ck1,cs1,at1,as1,ck2,cs2,at2,as2"
+
+    api_configs = build_api_config(api_urls, api_tokens)
+
+    for api in api_configs:
+        # Example of making an authenticated GET request
+        response = requests.get(api["url"], auth=api["auth"], timeout=10)
+        print(f"{api['url']} -> Status: {response.status_code}")
+
+
+if __name__ == "__main__":
+    main()
+
