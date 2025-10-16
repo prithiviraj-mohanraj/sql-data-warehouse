@@ -1,41 +1,113 @@
-# pyspark_local_run.py
-# Works inside VS Code on a locked-down client laptop (no PATH edits needed)
+# set_java_for_pyspark.py
+import os, shutil
+from pathlib import Path
 
-import os
+def ensure_java_home():
+    # If already set (PyCharm Run Config env var etc.), keep it
+    if os.environ.get("JAVA_HOME"):
+        return
+
+    java_exe = shutil.which("java")
+    if not java_exe:
+        raise RuntimeError("Java not found on PATH for this session.")
+
+    # Resolve .../bin/java -> JAVA_HOME = parent of bin
+    java_bin = Path(java_exe).resolve()
+    java_home = str(java_bin.parent.parent)
+    os.environ["JAVA_HOME"] = java_home
+    # prepend to PATH for child processes
+    os.environ["PATH"] = str(Path(java_home) / "bin") + os.pathsep + os.environ.get("PATH", "")
+
+ensure_java_home()
+
+# ---- now safe to start Spark ----
 from pyspark.sql import SparkSession
-
-# 👉 If java -version works in terminal, you can comment these 2 lines.
-# 👉 Otherwise, set your JDK folder manually here:
-java_home = r"C:\Program Files\Java\jdk-17"
-os.environ["JAVA_HOME"] = java_home
-os.environ["PATH"] = java_home + r"\bin;" + os.environ["PATH"]
-
-# ---- Start Spark locally ----
 spark = (
     SparkSession.builder
-    .appName("LocalSparkTest")
-    .master("local[*]")  # use all local cores
-    .config("spark.sql.warehouse.dir", "./warehouse")
-    .config("spark.local.dir", "./spark-tmp")
+    .appName("local-dev")
+    .master("local[*]")
+    .config("spark.sql.warehouse.dir", "./spark-warehouse")
     .getOrCreate()
 )
 
-print("✅ Java and Spark are set up correctly!")
-print("Spark version:", spark.version)
-
-# ---- Simple test job ----
-df = spark.createDataFrame([(1, "Alice"), (2, "Bob"), (3, "Cathy")], ["id", "name"])
-df.show()
-
-count = spark.sparkContext.parallelize(range(1000)).count()
-print("RDD count:", count)
-
-spark.stop()
-print("✅ PySpark ran successfully!")
 
 
+apis:
+  - name: knt
+    url: https://api.knt.example.com/v1/data
+    oauth1:
+      consumer_key: ${KNT_CONSUMER_KEY}
+      consumer_secret: ${KNT_CONSUMER_SECRET}
+      access_token: ${KNT_ACCESS_TOKEN}
+      access_secret: ${KNT_ACCESS_SECRET}
 
-python -m venv .venv
-. .\.venv\Scripts\Activate.ps1
-pip install pyspark==3.5.1
-python pyspark_local_run.py
+  - name: lnt
+    url: https://api.lnt.example.com/v1/data
+    oauth1:
+      consumer_key: ${LNT_CONSUMER_KEY}
+      consumer_secret: ${LNT_CONSUMER_SECRET}
+      access_token: ${LNT_ACCESS_TOKEN}
+      access_secret: ${LNT_ACCESS_SECRET}
+
+#!/usr/bin/env python3
+from typing import Dict, Tuple
+from requests_oauthlib import OAuth1
+import os
+import re
+import yaml
+
+_ENV_VAR_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
+
+def _expand_env(value: str) -> str:
+    """Replace ${ENV_VAR} placeholders with environment variable values."""
+    if not isinstance(value, str):
+        return value
+    def replace(match):
+        var = match.group(1)
+        val = os.getenv(var)
+        if val is None:
+            raise RuntimeError(f"Missing environment variable: {var}")
+        return val
+    return _ENV_VAR_PATTERN.sub(replace, value)
+
+def load_api_configs(yaml_path: str) -> Dict[str, Dict]:
+    """
+    Load API configs from YAML and build OAuth1 sessions.
+    Returns a dict keyed by API name (e.g., 'knt', 'lnt'):
+      { name: { 'url': str, 'auth': OAuth1 } }
+    """
+    with open(yaml_path, "r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+
+    configs: Dict[str, Dict] = {}
+    for entry in data.get("apis", []):
+        name = entry["name"].strip()
+        url = _expand_env(entry["url"])
+        creds = entry["oauth1"]
+        consumer_key    = _expand_env(creds["consumer_key"])
+        consumer_secret = _expand_env(creds["consumer_secret"])
+        access_token    = _expand_env(creds["access_token"])
+        access_secret   = _expand_env(creds["access_secret"])
+
+        configs[name] = {
+            "url": url,
+            "auth": OAuth1(consumer_key, consumer_secret, access_token, access_secret),
+        }
+
+    if not configs:
+        raise ValueError("No APIs defined in YAML.")
+    return configs
+
+def get_api(configs: Dict[str, Dict], name: str) -> Tuple[str, OAuth1]:
+    """Return (url, OAuth1) for a given API name."""
+    api = configs[name]  # KeyError if missing (intentional)
+    return api["url"], api["auth"]
+
+
+from api_credentials import load_api_configs, get_api
+
+configs = load_api_configs("apis.yaml")
+knt_url, knt_auth = get_api(configs, "knt")
+lnt_url, lnt_auth = get_api(configs, "lnt")
+# api_pull(knt_url, knt_auth)
+# api_pull(lnt_url, lnt_auth)
