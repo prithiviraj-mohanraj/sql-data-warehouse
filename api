@@ -32,3 +32,10 @@ print("RDD count:", count)
 
 spark.stop()
 print("✅ PySpark ran successfully!")
+
+
+
+python -m venv .venv
+. .\.venv\Scripts\Activate.ps1
+pip install pyspark==3.5.1
+python pyspark_local_run.py
