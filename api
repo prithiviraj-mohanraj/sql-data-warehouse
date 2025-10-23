@@ -111,3 +111,39 @@ knt_url, knt_auth = get_api(configs, "knt")
 lnt_url, lnt_auth = get_api(configs, "lnt")
 # api_pull(knt_url, knt_auth)
 # api_pull(lnt_url, lnt_auth)
+
+
+
+
+
+import os, re, yaml
+
+# Pattern to detect ${ENV_VAR}
+_ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
+
+def expand_env(value):
+    if not isinstance(value, str):
+        return value
+    return _ENV_PATTERN.sub(lambda m: os.environ[m.group(1)], value)
+
+def get_api_config(yaml_doc, api_name):
+    entry = next(api for api in yaml_doc["apis"] if api["name"] == api_name)
+    url = expand_env(entry["url"])
+    o = entry["oauth1"]
+    consumer_key    = expand_env(o["consumer_key"])
+    consumer_secret = expand_env(o["consumer_secret"])
+    access_token    = expand_env(o["access_token"])
+    access_secret   = expand_env(o["access_secret"])
+    return api_name, url, consumer_key, consumer_secret, access_token, access_secret
+
+# --- load YAML once ---
+with open("apis.yaml", "r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
+
+# --- extract creds for both APIs ---
+knt_name, knt_url, knt_ck, knt_cs, knt_at, knt_as = get_api_config(cfg, "knt")
+lnt_name, lnt_url, lnt_ck, lnt_cs, lnt_at, lnt_as = get_api_config(cfg, "lnt")
+
+# --- call your existing function (with name too) ---
+api_pull(knt_name, knt_url, knt_ck, knt_cs, knt_at, knt_as)
+api_pull(lnt_name, lnt_url, lnt_ck, lnt_cs, lnt_at, lnt_as)
