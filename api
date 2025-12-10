@@ -1,85 +1,18 @@
-# ──────────────────────────────────────────────────────────────────────────────
-# STEP 1.  open api_pull.py  (or whatever file defines api_pull)
-# ──────────────────────────────────────────────────────────────────────────────
-# Search for the start of the function:
-#   def api_pull(
-# Immediately after that line (inside the function body) add:
+system="$1"
 
-import time, os, requests
-from pyspark.sql import SparkSession
-
-ts = time.strftime("%Y%m%d_%H%M%S")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# STEP 2.  make Spark logging quieter (add at top of function)
-try:
-    spark.sparkContext.setLogLevel("WARN")
-except Exception:
-    pass
-
-# ──────────────────────────────────────────────────────────────────────────────
-# STEP 3.  ensure unique output / temp-view names
-# Find any line that looks like:
-#   df.createOrReplaceTempView("stg_raw")
-# Replace it with:
-df.createOrReplaceTempView(f"{name}_stg_raw")
-
-# If there are other fixed names such as "final_df" or "output_df",
-# replace them the same way:
-#   "output_df" → f"{name}_output_df"
-
-# ──────────────────────────────────────────────────────────────────────────────
-# STEP 4.  replace the API call with a session context
-# Find the first requests.get(...) call and replace that block with:
-
-with requests.Session() as sess:
-    resp = sess.get(url, auth=oauth, timeout=(15,120))
-    resp.raise_for_status()
-    payload = resp.json()
-
-# Keep the rest of your parsing code unchanged.
-
-# ──────────────────────────────────────────────────────────────────────────────
-# STEP 5.  before writing the DataFrame, add these 3 lines:
-df = df.cache()
-_ = df.count()
-target_dir = os.path.join(out_dir or "./out", f"{name}_{ts}")
-
-# If your current write is:
-#   df.write.mode("overwrite").parquet(out_path)
-# change it to:
-df.write.mode("overwrite").parquet(target_dir)
-
-# If it writes to Hive:
-#   df.write.mode("append").saveAsTable("db.table")
-# make it distinct per API:
-df.write.mode("append").saveAsTable(f"db.{name}_table")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# STEP 6.  after the write section, add cleanup:
-try:
-    df.unpersist(blocking=False)
-except Exception:
-    pass
-spark.catalog.clearCache()
-
-# ──────────────────────────────────────────────────────────────────────────────
-# STEP 7.  in your main driver file (e.g. main_job.py), call sequentially:
-# ──────────────────────────────────────────────────────────────────────────────
-from pyspark.sql import SparkSession
-from api_credentials import load_api_configs
-from your_module import api_pull
-
-spark = SparkSession.builder.appName("api_ingestion").getOrCreate()
-apis = load_api_configs("apis.yaml")
-
-knt_url, knt_auth = apis["knt"]["url"], apis["knt"]["auth"]
-lnt_url, lnt_auth = apis["lnt"]["url"], apis["lnt"]["auth"]
-
-api_pull(spark, "knt", knt_url, knt_auth, out_dir="./out", table="db.tbl_knt")
-api_pull(spark, "lnt", lnt_url, lnt_auth, out_dir="./out", table="db.tbl_lnt")
-
-spark.stop()
-# ──────────────────────────────────────────────────────────────────────────────
-# END OF PATCH
-# ──────────────────────────────────────────────────────────────────────────────
+case "$system" in
+  RC)
+    # RC needs 4 params
+    if [ $# -ne 4 ]; then
+        echo "ERROR: RC system requires 4 params. Got: $#"
+        exit 2
+    fi
+    ;;
+  *)
+    # Everything else needs 6 or 7 params
+    if [ $# -ne 7 ] && [ $# -ne 6 ]; then
+        echo "ERROR: System '$system' requires 6 or 7 params. Got: $#"
+        exit 2
+    fi
+    ;;
+esac
