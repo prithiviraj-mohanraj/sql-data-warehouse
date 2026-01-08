@@ -1,18 +1,74 @@
-system="$1"
+import socket
+import os
+import requests
+import traceback
 
-case "$system" in
-  RC)
-    # RC needs 4 params
-    if [ $# -ne 4 ]; then
-        echo "ERROR: RC system requires 4 params. Got: $#"
-        exit 2
-    fi
-    ;;
-  *)
-    # Everything else needs 6 or 7 params
-    if [ $# -ne 7 ] && [ $# -ne 6 ]; then
-        echo "ERROR: System '$system' requires 6 or 7 params. Got: $#"
-        exit 2
-    fi
-    ;;
-esac
+API_HOST = "api.domain.com"
+API_URL = "https://api.domain.com/endpoint"
+
+HEADERS = {
+    "Authorization": "Bearer YOUR_TOKEN_HERE",
+    "Content-Type": "application/json"
+}
+
+print("\n================ AWS GLUE API DIAGNOSTICS ================\n")
+
+# 1. DNS Resolution
+try:
+    ip = socket.gethostbyname(API_HOST)
+    print("1️⃣ DNS RESOLUTION: PASS ->", ip)
+except Exception as e:
+    print("1️⃣ DNS RESOLUTION: FAIL ->", e)
+    raise SystemExit()
+
+# 2. Network Reachability (443)
+try:
+    s = socket.socket()
+    s.settimeout(10)
+    s.connect((API_HOST, 443))
+    s.close()
+    print("2️⃣ NETWORK (443): PASS")
+except Exception as e:
+    print("2️⃣ NETWORK (443): FAIL ->", e)
+    raise SystemExit()
+
+# 3. CURL Test
+print("\n3️⃣ CURL TEST:")
+os.system(f"curl -vk {API_URL}")
+
+# 4. Python call without headers
+try:
+    r = requests.get(API_URL, timeout=60)
+    print("\n4️⃣ PYTHON NO HEADERS:", r.status_code)
+except Exception as e:
+    print("4️⃣ PYTHON NO HEADERS: FAIL")
+    traceback.print_exc()
+    raise SystemExit()
+
+# 5. Python call with headers
+try:
+    r = requests.get(API_URL, headers=HEADERS, timeout=60)
+    print("\n5️⃣ PYTHON WITH HEADERS:", r.status_code)
+    print("RESPONSE:", r.text[:500])
+except Exception as e:
+    print("5️⃣ PYTHON WITH HEADERS: FAIL")
+    traceback.print_exc()
+    raise SystemExit()
+
+# 6. SSL verify disabled (certificate test)
+try:
+    r = requests.get(API_URL, headers=HEADERS, verify=False, timeout=60)
+    print("\n6️⃣ SSL VERIFY FALSE:", r.status_code)
+except Exception as e:
+    print("6️⃣ SSL VERIFY FALSE: FAIL")
+    traceback.print_exc()
+
+# 7. Large timeout test
+try:
+    r = requests.get(API_URL, headers=HEADERS, timeout=180)
+    print("\n7️⃣ TIMEOUT TEST (180s):", r.status_code)
+except Exception as e:
+    print("7️⃣ TIMEOUT TEST: FAIL")
+    traceback.print_exc()
+
+print("\n================ DIAGNOSTICS COMPLETED =================\n")
