@@ -210,3 +210,86 @@ output/metrics.csv → record counts & oldest dates
 output/hive_columns.csv → column inventory
 output/table_ddl.sql → audit DDL
 
+
+
+Step 1 — Generate SQL (Single Connection)
+We will fetch all tables per schema in one run.
+🔹 scripts/01_generate_table_sql.sh
+Bash
+Copy code
+#!/bin/bash
+
+INPUT="../input/migration_scope.csv"
+OUT="../logs/table_inventory.sql"
+
+mkdir -p ../logs
+> $OUT
+
+echo "-- Auto generated table inventory" >> $OUT
+
+cut -d',' -f1 $INPUT | tail -n +2 | sort -u | while read SCHEMA
+do
+    echo "SHOW TABLES IN $SCHEMA;" >> $OUT
+done
+
+Step 2 — Run Once (Single Impala Connection)
+🔹 scripts/02_run_table_inventory.sh
+Bash
+Copy code
+#!/bin/bash
+
+IMPALA_HOST="your-impala-host"
+
+impala-shell -k -i $IMPALA_HOST -f ../logs/table_inventory.sql -B \
+> ../output/schema_tables_raw.txt
+
+
+Step 3 — Build Final Report
+This step compares Excel input vs actual tables.
+🔹 scripts/03_build_table_report.sh
+Bash
+Copy code
+#!/bin/bash
+
+INPUT="../input/migration_scope.csv"
+RAW="../output/schema_tables_raw.txt"
+OUT="../output/tables_summary.csv"
+
+echo "schema,table_from_input,table_exists,total_tables_in_schema,tables_in_schema" > $OUT
+
+# Build schema → table list map
+awk '
+BEGIN{schema=""}
+/Fetched/ {next}
+/rows/ {next}
+/^$/ {next}
+{
+  if ($1 ~ /^[a-zA-Z0-9_]+$/ && schema=="") {
+      schema=$1
+      next
+  }
+}
+' $RAW
+
+# Process each schema
+cut -d',' -f1 $INPUT | tail -n +2 | sort -u | while read SCHEMA
+do
+    TABLE_LIST=$(grep -A1000 "SHOW TABLES IN $SCHEMA" ../logs/table_inventory.sql >/dev/null 2>&1; \
+    grep -A1000 "$SCHEMA" $RAW | tail -n +2 | tr '\n' '|' )
+
+    TOTAL=$(echo $TABLE_LIST | tr '|' '\n' | grep -v '^$' | wc -l)
+
+    # Check each input table
+    grep "^$SCHEMA," $INPUT | cut -d',' -f2 | while read TABLE
+    do
+        if echo "$TABLE_LIST" | grep -w "$TABLE" >/dev/null; then
+            EXISTS="YES"
+        else
+            EXISTS="NO"
+        fi
+
+        echo "$SCHEMA,$TABLE,$EXISTS,$TOTAL,$TABLE_LIST" >> $OUT
+    done
+done
+
+
