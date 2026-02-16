@@ -1,74 +1,212 @@
-import socket
-import os
-import requests
-import traceback
+validation/
+├── input/
+│   ├── migration_scope.csv
+│   └── business_days.txt
+├── scripts/
+│   ├── run_all.sh
+│   ├── 01_check_schema.sh
+│   ├── 02_check_tables.sh
+│   ├── 03_extract_columns.sh
+│   ├── 04_column_validation.sh
+│   ├── 05_column_counts.sh
+│   ├── 06_metrics.sh
+│   ├── 07_extract_ddl.sh
+│   └── 08_finalize.sh
+├── output/
+├── logs/
+└── README.md
 
-API_HOST = "api.domain.com"
-API_URL = "https://api.domain.com/endpoint"
+input/migration_scope.csv
+schema_name,table_name,column_name
+sales,orders,order_id
+sales,orders,amount
+sales,customers,customer_id
 
-HEADERS = {
-    "Authorization": "Bearer YOUR_TOKEN_HERE",
-    "Content-Type": "application/json"
-}
+input/business_days.txt
+2024-01-01
+2024-02-01
+2024-03-01
+scripts/run_all.sh
+#!/bin/bash
+set -e
 
-print("\n================ AWS GLUE API DIAGNOSTICS ================\n")
+echo "Starting Hive validation..."
 
-# 1. DNS Resolution
-try:
-    ip = socket.gethostbyname(API_HOST)
-    print("1️⃣ DNS RESOLUTION: PASS ->", ip)
-except Exception as e:
-    print("1️⃣ DNS RESOLUTION: FAIL ->", e)
-    raise SystemExit()
+cd "$(dirname "$0")"
 
-# 2. Network Reachability (443)
-try:
-    s = socket.socket()
-    s.settimeout(10)
-    s.connect((API_HOST, 443))
-    s.close()
-    print("2️⃣ NETWORK (443): PASS")
-except Exception as e:
-    print("2️⃣ NETWORK (443): FAIL ->", e)
-    raise SystemExit()
+mkdir -p ../output ../logs
 
-# 3. CURL Test
-print("\n3️⃣ CURL TEST:")
-os.system(f"curl -vk {API_URL}")
+bash 01_check_schema.sh
+bash 02_check_tables.sh
+bash 03_extract_columns.sh
+bash 04_column_validation.sh
+bash 05_column_counts.sh
+bash 06_metrics.sh
+bash 07_extract_ddl.sh
+bash 08_finalize.sh
 
-# 4. Python call without headers
-try:
-    r = requests.get(API_URL, timeout=60)
-    print("\n4️⃣ PYTHON NO HEADERS:", r.status_code)
-except Exception as e:
-    print("4️⃣ PYTHON NO HEADERS: FAIL")
-    traceback.print_exc()
-    raise SystemExit()
+echo "Validation completed. Final file: output/final_validation.csv"
 
-# 5. Python call with headers
-try:
-    r = requests.get(API_URL, headers=HEADERS, timeout=60)
-    print("\n5️⃣ PYTHON WITH HEADERS:", r.status_code)
-    print("RESPONSE:", r.text[:500])
-except Exception as e:
-    print("5️⃣ PYTHON WITH HEADERS: FAIL")
-    traceback.print_exc()
-    raise SystemExit()
 
-# 6. SSL verify disabled (certificate test)
-try:
-    r = requests.get(API_URL, headers=HEADERS, verify=False, timeout=60)
-    print("\n6️⃣ SSL VERIFY FALSE:", r.status_code)
-except Exception as e:
-    print("6️⃣ SSL VERIFY FALSE: FAIL")
-    traceback.print_exc()
+scripts/01_check_schema.sh
 
-# 7. Large timeout test
-try:
-    r = requests.get(API_URL, headers=HEADERS, timeout=180)
-    print("\n7️⃣ TIMEOUT TEST (180s):", r.status_code)
-except Exception as e:
-    print("7️⃣ TIMEOUT TEST: FAIL")
-    traceback.print_exc()
+#!/bin/bash
+INPUT="../input/migration_scope.csv"
+OUT="../output/schemas.csv"
 
-print("\n================ DIAGNOSTICS COMPLETED =================\n")
+echo "schema,exists" > $OUT
+
+cut -d',' -f1 $INPUT | tail -n +2 | sort -u | while read SCHEMA
+do
+    EXISTS=$(impala-shell -q "SHOW DATABASES LIKE '$SCHEMA';" -B | grep -w $SCHEMA || true)
+
+    if [ -z "$EXISTS" ]; then
+        echo "$SCHEMA,NO" >> $OUT
+    else
+        echo "$SCHEMA,YES" >> $OUT
+    fi
+done
+
+
+
+scripts/02_check_tables.sh
+#!/bin/bash
+INPUT="../input/migration_scope.csv"
+OUT="../output/tables.csv"
+
+echo "schema,table,exists" > $OUT
+
+tail -n +2 $INPUT | cut -d',' -f1,2 | sort -u | while IFS=',' read SCHEMA TABLE
+do
+    EXISTS=$(impala-shell -q "SHOW TABLES IN $SCHEMA LIKE '$TABLE';" -B | grep -w $TABLE || true)
+
+    if [ -z "$EXISTS" ]; then
+        echo "$SCHEMA,$TABLE,NO" >> $OUT
+    else
+        echo "$SCHEMA,$TABLE,YES" >> $OUT
+    fi
+done
+
+
+scripts/03_extract_columns.sh
+
+#!/bin/bash
+INPUT="../input/migration_scope.csv"
+OUT="../output/hive_columns.csv"
+
+echo "schema,table,column,data_type" > $OUT
+
+tail -n +2 $INPUT | cut -d',' -f1,2 | sort -u | while IFS=',' read SCHEMA TABLE
+do
+    impala-shell -q "DESCRIBE $SCHEMA.$TABLE;" -B | \
+    awk -v s="$SCHEMA" -v t="$TABLE" 'NF>=2 {print s","t","$1","$2}' >> $OUT
+done
+
+
+#!/bin/bash
+INPUT="../input/migration_scope.csv"
+HIVE_COLS="../output/hive_columns.csv"
+OUT="../output/column_validation.csv"
+
+echo "schema,table,column,exists_in_hive" > $OUT
+
+tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE COLUMN
+do
+    EXISTS=$(grep -i "^$SCHEMA,$TABLE,$COLUMN," $HIVE_COLS || true)
+
+    if [ -z "$EXISTS" ]; then
+        echo "$SCHEMA,$TABLE,$COLUMN,NO" >> $OUT
+    else
+        echo "$SCHEMA,$TABLE,$COLUMN,YES" >> $OUT
+    fi
+done
+
+
+Column Counts per Table
+🔹 scripts/05_column_counts.sh
+
+
+#!/bin/bash
+HIVE_COLS="../output/hive_columns.csv"
+OUT="../output/column_counts.csv"
+
+echo "schema,table,column_count" > $OUT
+
+tail -n +2 $HIVE_COLS | cut -d',' -f1,2 | sort | uniq -c | \
+awk '{print $2","$3","$1}' >> $OUT
+
+Metrics: Oldest Record & Counts
+🔹 scripts/06_metrics.sh
+
+#!/bin/bash
+INPUT="../input/migration_scope.csv"
+DATES_FILE="../input/business_days.txt"
+OUT="../output/metrics.csv"
+
+HEADER="schema,table,oldest_business_day"
+for DATE in $(cat $DATES_FILE); do
+    HEADER="$HEADER,count_${DATE//-/_}"
+done
+echo $HEADER > $OUT
+
+tail -n +2 $INPUT | cut -d',' -f1,2 | sort -u | while IFS=',' read SCHEMA TABLE
+do
+    echo "Processing metrics for $SCHEMA.$TABLE"
+
+    OLDEST=$(impala-shell -q "SELECT MIN(business_day) FROM $SCHEMA.$TABLE;" -B | tail -n 1)
+
+    ROW="$SCHEMA,$TABLE,$OLDEST"
+
+    for DATE in $(cat $DATES_FILE)
+    do
+        CNT=$(impala-shell -q "SELECT COUNT(*) FROM $SCHEMA.$TABLE WHERE business_day='$DATE';" -B | tail -n 1)
+        ROW="$ROW,$CNT"
+    done
+
+    echo $ROW >> $OUT
+done
+
+
+Extract Table DDL (Audit)
+🔹 scripts/07_extract_ddl.sh
+
+#!/bin/bash
+INPUT="../input/migration_scope.csv"
+OUT="../output/table_ddl.sql"
+
+> $OUT
+
+tail -n +2 $INPUT | cut -d',' -f1,2 | sort -u | while IFS=',' read SCHEMA TABLE
+do
+    echo "-- $SCHEMA.$TABLE" >> $OUT
+    impala-shell -q "SHOW CREATE TABLE $SCHEMA.$TABLE;" -B >> $OUT
+    echo "" >> $OUT
+done
+
+Final Consolidation
+🔹 scripts/08_finalize.sh
+
+#!/bin/bash
+
+OUT="../output/final_validation.csv"
+
+echo "schema,table,column,data_type,column_exists,column_count" > $OUT
+
+join -t',' \
+ <(sort ../output/hive_columns.csv) \
+ <(sort ../output/column_validation.csv) \
+ >> $OUT || true
+
+
+Hive Validation Framework
+
+Run:
+cd scripts
+bash run_all.sh
+
+Outputs:
+output/final_validation.csv → main comparison file
+output/metrics.csv → record counts & oldest dates
+output/hive_columns.csv → column inventory
+output/table_ddl.sql → audit DDL
+
