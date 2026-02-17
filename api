@@ -1,295 +1,150 @@
 validation/
 ├── input/
-│   ├── migration_scope.csv
-│   └── business_days.txt
+│   └── migration_scope.csv
 ├── scripts/
-│   ├── run_all.sh
-│   ├── 01_check_schema.sh
-│   ├── 02_check_tables.sh
-│   ├── 03_extract_columns.sh
-│   ├── 04_column_validation.sh
-│   ├── 05_column_counts.sh
-│   ├── 06_metrics.sh
-│   ├── 07_extract_ddl.sh
-│   └── 08_finalize.sh
+│   ├── 01_extract_scope.sh
+│   ├── 02_check_tables_single_session.sh
+│   ├── 03_extract_columns_single_session.sh
+│   ├── 04_column_counts.sh
+│   └── run_all.sh
 ├── output/
-├── logs/
-└── README.md
+└── logs/
 
+
+INPUT FILE
 input/migration_scope.csv
+Copy code
+
 schema_name,table_name,column_name
 sales,orders,order_id
 sales,orders,amount
-sales,customers,customer_id
+sales,returns,return_id
+finance,txn,txn_id
+finance,txn,amount
 
-input/business_days.txt
-2024-01-01
-2024-02-01
-2024-03-01
-scripts/run_all.sh
+STEP 1 — Extract Schemas & Tables From CSV
+✔ No database connection
+✔ Produces summary file
+scripts/01_extract_scope.sh
+Bash
+Copy code
 #!/bin/bash
-set -e
 
-echo "Starting Hive validation..."
-
-cd "$(dirname "$0")"
+INPUT="../input/migration_scope.csv"
+OUT="../output/scope_summary.csv"
 
 mkdir -p ../output ../logs
 
-bash 01_check_schema.sh
-bash 02_check_tables.sh
-bash 03_extract_columns.sh
-bash 04_column_validation.sh
-bash 05_column_counts.sh
-bash 06_metrics.sh
-bash 07_extract_ddl.sh
-bash 08_finalize.sh
+echo "schema,table" > $OUT
 
-echo "Validation completed. Final file: output/final_validation.csv"
+awk -F',' 'NR>1 {print $1","$2}' $INPUT | sort -u >> $OUT
+
+# Count schemas & tables
+SCHEMA_COUNT=$(cut -d',' -f1 $OUT | tail -n +2 | sort -u | wc -l)
+TABLE_COUNT=$(tail -n +2 $OUT | wc -l)
+
+echo "Total Schemas: $SCHEMA_COUNT"
+echo "Total Tables: $TABLE_COUNT"
 
 
-scripts/01_check_schema.sh
+STEP 2 — Check Table Presence (ONE CONNECTION)
+✔ Only CSV tables checked
+✔ No full schema listing
+scripts/02_check_tables_single_session.sh
 
 #!/bin/bash
-INPUT="../input/migration_scope.csv"
-OUT="../output/schemas.csv"
 
-echo "schema,exists" > $OUT
+SCOPE="../output/scope_summary.csv"
+SQL_FILE="../logs/check_tables.sql"
+RAW_OUT="../logs/check_tables_raw.txt"
+OUT="../output/table_presence.csv"
 
-cut -d',' -f1 $INPUT | tail -n +2 | sort -u | while read SCHEMA
+echo "schema,table,exists_in_hive" > $OUT
+> $SQL_FILE
+
+# Generate SQL (single session)
+tail -n +2 $SCOPE | while IFS=',' read SCHEMA TABLE
 do
-    EXISTS=$(impala-shell -q "SHOW DATABASES LIKE '$SCHEMA';" -B | grep -w $SCHEMA || true)
-
-    if [ -z "$EXISTS" ]; then
-        echo "$SCHEMA,NO" >> $OUT
-    else
-        echo "$SCHEMA,YES" >> $OUT
-    fi
+    echo "SHOW TABLES IN $SCHEMA LIKE '$TABLE';" >> $SQL_FILE
 done
 
+# Run once
+impala-shell -k -i your-host -f $SQL_FILE -B > $RAW_OUT
 
-
-scripts/02_check_tables.sh
-#!/bin/bash
-INPUT="../input/migration_scope.csv"
-OUT="../output/tables.csv"
-
-echo "schema,table,exists" > $OUT
-
-tail -n +2 $INPUT | cut -d',' -f1,2 | sort -u | while IFS=',' read SCHEMA TABLE
+# Parse results
+INDEX=0
+tail -n +2 $SCOPE | while IFS=',' read SCHEMA TABLE
 do
-    EXISTS=$(impala-shell -q "SHOW TABLES IN $SCHEMA LIKE '$TABLE';" -B | grep -w $TABLE || true)
+    RESULT=$(sed -n "$((INDEX+1))p" $RAW_OUT | grep -w "$TABLE" || true)
 
-    if [ -z "$EXISTS" ]; then
+    if [ -z "$RESULT" ]; then
         echo "$SCHEMA,$TABLE,NO" >> $OUT
     else
         echo "$SCHEMA,$TABLE,YES" >> $OUT
     fi
+
+    ((INDEX++))
 done
 
+echo "Table presence file → $OUT"
 
-scripts/03_extract_columns.sh
+
+STEP 3 — Extract Columns & Datatypes (ONE CONNECTION)
+✔ DESCRIBE all tables in one session
+✔ Produces one clean file
+scripts/03_extract_columns_single_session.sh
 
 #!/bin/bash
-INPUT="../input/migration_scope.csv"
-OUT="../output/hive_columns.csv"
+
+SCOPE="../output/scope_summary.csv"
+SQL_FILE="../logs/describe_tables.sql"
+RAW_OUT="../logs/describe_raw.txt"
+OUT="../output/table_columns.csv"
 
 echo "schema,table,column,data_type" > $OUT
+> $SQL_FILE
 
-tail -n +2 $INPUT | cut -d',' -f1,2 | sort -u | while IFS=',' read SCHEMA TABLE
+# Generate SQL
+tail -n +2 $SCOPE | while IFS=',' read SCHEMA TABLE
 do
-    impala-shell -q "DESCRIBE $SCHEMA.$TABLE;" -B | \
-    awk -v s="$SCHEMA" -v t="$TABLE" 'NF>=2 {print s","t","$1","$2}' >> $OUT
+    echo "DESCRIBE $SCHEMA.$TABLE;" >> $SQL_FILE
 done
 
+# Run once
+impala-shell -k -i your-host -f $SQL_FILE -B > $RAW_OUT
 
-#!/bin/bash
-INPUT="../input/migration_scope.csv"
-HIVE_COLS="../output/hive_columns.csv"
-OUT="../output/column_validation.csv"
+# Parse output
+CURRENT_SCHEMA=""
+CURRENT_TABLE=""
 
-echo "schema,table,column,exists_in_hive" > $OUT
-
-tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE COLUMN
+tail -n +2 $SCOPE | while IFS=',' read SCHEMA TABLE
 do
-    EXISTS=$(grep -i "^$SCHEMA,$TABLE,$COLUMN," $HIVE_COLS || true)
+    CURRENT_SCHEMA=$SCHEMA
+    CURRENT_TABLE=$TABLE
 
-    if [ -z "$EXISTS" ]; then
-        echo "$SCHEMA,$TABLE,$COLUMN,NO" >> $OUT
-    else
-        echo "$SCHEMA,$TABLE,$COLUMN,YES" >> $OUT
-    fi
+    # Extract DESCRIBE block for this table
+    awk -v s="$SCHEMA" -v t="$TABLE" '
+    NF>=2 && $1 != "#" {
+        print s","t","$1","$2
+    }' $RAW_OUT >> $OUT
+
 done
 
+echo "Column inventory → $OUT"
 
-Column Counts per Table
-🔹 scripts/05_column_counts.sh
-
+STEP 4 — Column Counts (No DB Connection)
+scripts/04_column_counts.sh
 
 #!/bin/bash
-HIVE_COLS="../output/hive_columns.csv"
+
+COL_FILE="../output/table_columns.csv"
 OUT="../output/column_counts.csv"
 
 echo "schema,table,column_count" > $OUT
 
-tail -n +2 $HIVE_COLS | cut -d',' -f1,2 | sort | uniq -c | \
+tail -n +2 $COL_FILE | cut -d',' -f1,2 | sort | uniq -c | \
 awk '{print $2","$3","$1}' >> $OUT
 
-Metrics: Oldest Record & Counts
-🔹 scripts/06_metrics.sh
-
-#!/bin/bash
-INPUT="../input/migration_scope.csv"
-DATES_FILE="../input/business_days.txt"
-OUT="../output/metrics.csv"
-
-HEADER="schema,table,oldest_business_day"
-for DATE in $(cat $DATES_FILE); do
-    HEADER="$HEADER,count_${DATE//-/_}"
-done
-echo $HEADER > $OUT
-
-tail -n +2 $INPUT | cut -d',' -f1,2 | sort -u | while IFS=',' read SCHEMA TABLE
-do
-    echo "Processing metrics for $SCHEMA.$TABLE"
-
-    OLDEST=$(impala-shell -q "SELECT MIN(business_day) FROM $SCHEMA.$TABLE;" -B | tail -n 1)
-
-    ROW="$SCHEMA,$TABLE,$OLDEST"
-
-    for DATE in $(cat $DATES_FILE)
-    do
-        CNT=$(impala-shell -q "SELECT COUNT(*) FROM $SCHEMA.$TABLE WHERE business_day='$DATE';" -B | tail -n 1)
-        ROW="$ROW,$CNT"
-    done
-
-    echo $ROW >> $OUT
-done
-
-
-Extract Table DDL (Audit)
-🔹 scripts/07_extract_ddl.sh
-
-#!/bin/bash
-INPUT="../input/migration_scope.csv"
-OUT="../output/table_ddl.sql"
-
-> $OUT
-
-tail -n +2 $INPUT | cut -d',' -f1,2 | sort -u | while IFS=',' read SCHEMA TABLE
-do
-    echo "-- $SCHEMA.$TABLE" >> $OUT
-    impala-shell -q "SHOW CREATE TABLE $SCHEMA.$TABLE;" -B >> $OUT
-    echo "" >> $OUT
-done
-
-Final Consolidation
-🔹 scripts/08_finalize.sh
-
-#!/bin/bash
-
-OUT="../output/final_validation.csv"
-
-echo "schema,table,column,data_type,column_exists,column_count" > $OUT
-
-join -t',' \
- <(sort ../output/hive_columns.csv) \
- <(sort ../output/column_validation.csv) \
- >> $OUT || true
-
-
-Hive Validation Framework
-
-Run:
-cd scripts
-bash run_all.sh
-
-Outputs:
-output/final_validation.csv → main comparison file
-output/metrics.csv → record counts & oldest dates
-output/hive_columns.csv → column inventory
-output/table_ddl.sql → audit DDL
-
-
-
-Step 1 — Generate SQL (Single Connection)
-We will fetch all tables per schema in one run.
-🔹 scripts/01_generate_table_sql.sh
-Bash
-Copy code
-#!/bin/bash
-
-INPUT="../input/migration_scope.csv"
-OUT="../logs/table_inventory.sql"
-
-mkdir -p ../logs
-> $OUT
-
-echo "-- Auto generated table inventory" >> $OUT
-
-cut -d',' -f1 $INPUT | tail -n +2 | sort -u | while read SCHEMA
-do
-    echo "SHOW TABLES IN $SCHEMA;" >> $OUT
-done
-
-Step 2 — Run Once (Single Impala Connection)
-🔹 scripts/02_run_table_inventory.sh
-Bash
-Copy code
-#!/bin/bash
-
-IMPALA_HOST="your-impala-host"
-
-impala-shell -k -i $IMPALA_HOST -f ../logs/table_inventory.sql -B \
-> ../output/schema_tables_raw.txt
-
-
-Step 3 — Build Final Report
-This step compares Excel input vs actual tables.
-🔹 scripts/03_build_table_report.sh
-Bash
-Copy code
-#!/bin/bash
-
-INPUT="../input/migration_scope.csv"
-RAW="../output/schema_tables_raw.txt"
-OUT="../output/tables_summary.csv"
-
-echo "schema,table_from_input,table_exists,total_tables_in_schema,tables_in_schema" > $OUT
-
-# Build schema → table list map
-awk '
-BEGIN{schema=""}
-/Fetched/ {next}
-/rows/ {next}
-/^$/ {next}
-{
-  if ($1 ~ /^[a-zA-Z0-9_]+$/ && schema=="") {
-      schema=$1
-      next
-  }
-}
-' $RAW
-
-# Process each schema
-cut -d',' -f1 $INPUT | tail -n +2 | sort -u | while read SCHEMA
-do
-    TABLE_LIST=$(grep -A1000 "SHOW TABLES IN $SCHEMA" ../logs/table_inventory.sql >/dev/null 2>&1; \
-    grep -A1000 "$SCHEMA" $RAW | tail -n +2 | tr '\n' '|' )
-
-    TOTAL=$(echo $TABLE_LIST | tr '|' '\n' | grep -v '^$' | wc -l)
-
-    # Check each input table
-    grep "^$SCHEMA," $INPUT | cut -d',' -f2 | while read TABLE
-    do
-        if echo "$TABLE_LIST" | grep -w "$TABLE" >/dev/null; then
-            EXISTS="YES"
-        else
-            EXISTS="NO"
-        fi
-
-        echo "$SCHEMA,$TABLE,$EXISTS,$TOTAL,$TABLE_LIST" >> $OUT
-    done
-done
+echo "Column counts file → $OUT"
 
 
