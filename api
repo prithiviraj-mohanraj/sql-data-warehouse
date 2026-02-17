@@ -1,150 +1,147 @@
-validation/
-├── input/
-│   └── migration_scope.csv
-├── scripts/
-│   ├── 01_extract_scope.sh
-│   ├── 02_check_tables_single_session.sh
-│   ├── 03_extract_columns_single_session.sh
-│   ├── 04_column_counts.sh
-│   └── run_all.sh
-├── output/
-└── logs/
-
-
-INPUT FILE
-input/migration_scope.csv
-Copy code
-
-schema_name,table_name,column_name
-sales,orders,order_id
-sales,orders,amount
-sales,returns,return_id
-finance,txn,txn_id
-finance,txn,amount
-
-STEP 1 — Extract Schemas & Tables From CSV
-✔ No database connection
-✔ Produces summary file
-scripts/01_extract_scope.sh
-Bash
-Copy code
-#!/bin/bash
-
-INPUT="../input/migration_scope.csv"
-OUT="../output/scope_summary.csv"
-
-mkdir -p ../output ../logs
-
-echo "schema,table" > $OUT
-
-awk -F',' 'NR>1 {print $1","$2}' $INPUT | sort -u >> $OUT
-
-# Count schemas & tables
-SCHEMA_COUNT=$(cut -d',' -f1 $OUT | tail -n +2 | sort -u | wc -l)
-TABLE_COUNT=$(tail -n +2 $OUT | wc -l)
-
-echo "Total Schemas: $SCHEMA_COUNT"
-echo "Total Tables: $TABLE_COUNT"
-
-
-STEP 2 — Check Table Presence (ONE CONNECTION)
-✔ Only CSV tables checked
-✔ No full schema listing
-scripts/02_check_tables_single_session.sh
-
-#!/bin/bash
-
-SCOPE="../output/scope_summary.csv"
-SQL_FILE="../logs/check_tables.sql"
-RAW_OUT="../logs/check_tables_raw.txt"
-OUT="../output/table_presence.csv"
-
-echo "schema,table,exists_in_hive" > $OUT
-> $SQL_FILE
-
-# Generate SQL (single session)
-tail -n +2 $SCOPE | while IFS=',' read SCHEMA TABLE
-do
-    echo "SHOW TABLES IN $SCHEMA LIKE '$TABLE';" >> $SQL_FILE
-done
-
-# Run once
-impala-shell -k -i your-host -f $SQL_FILE -B > $RAW_OUT
-
-# Parse results
-INDEX=0
-tail -n +2 $SCOPE | while IFS=',' read SCHEMA TABLE
-do
-    RESULT=$(sed -n "$((INDEX+1))p" $RAW_OUT | grep -w "$TABLE" || true)
-
-    if [ -z "$RESULT" ]; then
-        echo "$SCHEMA,$TABLE,NO" >> $OUT
-    else
-        echo "$SCHEMA,$TABLE,YES" >> $OUT
-    fi
-
-    ((INDEX++))
-done
-
-echo "Table presence file → $OUT"
-
-
-STEP 3 — Extract Columns & Datatypes (ONE CONNECTION)
-✔ DESCRIBE all tables in one session
-✔ Produces one clean file
-scripts/03_extract_columns_single_session.sh
-
+Script to Generate Safe DESCRIBE Output
+scripts/03_extract_columns_raw.sh
 #!/bin/bash
 
 SCOPE="../output/scope_summary.csv"
 SQL_FILE="../logs/describe_tables.sql"
 RAW_OUT="../logs/describe_raw.txt"
-OUT="../output/table_columns.csv"
 
-echo "schema,table,column,data_type" > $OUT
+mkdir -p ../logs
+
 > $SQL_FILE
 
-# Generate SQL
+# Generate SQL with markers
 tail -n +2 $SCOPE | while IFS=',' read SCHEMA TABLE
 do
-    echo "DESCRIBE $SCHEMA.$TABLE;" >> $SQL_FILE
+    echo "SELECT 'START:${SCHEMA}.${TABLE}';" >> $SQL_FILE
+    echo "DESCRIBE ${SCHEMA}.${TABLE};" >> $SQL_FILE
+    echo "SELECT 'END:${SCHEMA}.${TABLE}';" >> $SQL_FILE
 done
 
-# Run once
+# Run once (single connection)
 impala-shell -k -i your-host -f $SQL_FILE -B > $RAW_OUT
 
-# Parse output
-CURRENT_SCHEMA=""
-CURRENT_TABLE=""
-
-tail -n +2 $SCOPE | while IFS=',' read SCHEMA TABLE
-do
-    CURRENT_SCHEMA=$SCHEMA
-    CURRENT_TABLE=$TABLE
-
-    # Extract DESCRIBE block for this table
-    awk -v s="$SCHEMA" -v t="$TABLE" '
-    NF>=2 && $1 != "#" {
-        print s","t","$1","$2
-    }' $RAW_OUT >> $OUT
-
-done
-
-echo "Column inventory → $OUT"
-
-STEP 4 — Column Counts (No DB Connection)
-scripts/04_column_counts.sh
-
-#!/bin/bash
-
-COL_FILE="../output/table_columns.csv"
-OUT="../output/column_counts.csv"
-
-echo "schema,table,column_count" > $OUT
-
-tail -n +2 $COL_FILE | cut -d',' -f1,2 | sort | uniq -c | \
-awk '{print $2","$3","$1}' >> $OUT
-
-echo "Column counts file → $OUT"
+echo "Raw describe output with table markers → $RAW_OUT"
 
 
+Option 1 — Parse Using Python (Recommended)
+scripts/parse_columns.py
+import csv
+
+input_file = "../logs/describe_raw.txt"
+output_file = "../output/table_columns.csv"
+
+with open(input_file) as f, open(output_file, "w", newline="") as out:
+    writer = csv.writer(out)
+    writer.writerow(["schema", "table", "column", "data_type"])
+
+    current_schema = None
+    current_table = None
+
+    for line in f:
+        line = line.strip()
+
+        if line.startswith("START:"):
+            schema_table = line.split(":")[1]
+            current_schema, current_table = schema_table.split(".")
+            continue
+
+        if line.startswith("END:"):
+            current_schema = None
+            current_table = None
+            continue
+
+        if current_schema and line and not line.startswith("#"):
+            parts = line.split()
+            if len(parts) >= 2:
+                writer.writerow([current_schema, current_table, parts[0], parts[1]])
+
+print("Parsed column file created.")
+
+
+Option 2 — Parse Using AWK (If Python Not Allowed)
+
+awk '
+/START:/ {
+    split($0,a,":");
+    split(a[2],b,".");
+    schema=b[1]; table=b[2];
+    next;
+}
+/END:/ { schema=""; table=""; next; }
+NF>=2 && schema!="" && $1!="#" {
+    print schema","table","$1","$2;
+}
+' ../logs/describe_raw.txt > ../output/table_columns.csv
+
+import csv
+
+input_file = "../logs/describe_raw.txt"
+output_file = "../output/table_columns.csv"
+
+with open(input_file) as f, open(output_file, "w", newline="") as out:
+    writer = csv.writer(out)
+    writer.writerow(["schema", "table", "column", "data_type", "column_type"])
+
+    current_schema = None
+    current_table = None
+    column_type = "BASE"
+
+    for line in f:
+        line = line.strip()
+
+        if line.startswith("START:"):
+            schema_table = line.split(":")[1]
+            current_schema, current_table = schema_table.split(".")
+            column_type = "BASE"
+            continue
+
+        if line.startswith("END:"):
+            current_schema = None
+            current_table = None
+            continue
+
+        # Detect partition section
+        if "Partition Information" in line:
+            column_type = "PARTITION"
+            continue
+
+        # Skip header lines
+        if line.startswith("#") or line.startswith("col_name"):
+            continue
+
+        if current_schema and line:
+            parts = line.split()
+            if len(parts) >= 2:
+                writer.writerow([
+                    current_schema,
+                    current_table,
+                    parts[0],
+                    parts[1],
+                    column_type
+                ])
+
+print("Partition-safe column file created.")
+
+Column Count Script (Python)
+
+import csv
+from collections import defaultdict
+
+counts = defaultdict(lambda: {"BASE":0, "PARTITION":0})
+
+with open("../output/table_columns.csv") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        key = (row["schema"], row["table"])
+        counts[key][row["column_type"]] += 1
+
+with open("../output/column_counts.csv", "w", newline="") as out:
+    writer = csv.writer(out)
+    writer.writerow(["schema","table","base_columns","partition_columns","total_columns"])
+
+    for (schema, table), vals in counts.items():
+        total = vals["BASE"] + vals["PARTITION"]
+        writer.writerow([schema, table, vals["BASE"], vals["PARTITION"], total])
+
+print("Column counts created.")
