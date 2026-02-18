@@ -5,6 +5,8 @@ validation/
 │   └── extract_tables.sh
 ├── output/
 └── logs/
+
+
 scripts/extract_tables.sh
 #!/bin/bash
 set -e
@@ -69,6 +71,8 @@ done < $RAW_OUT
 echo "Done."
 echo "Tables file → $OUT_TABLES"
 echo "Counts file → $OUT_COUNTS"
+
+
 scripts/extract_columns.sh
 #!/bin/bash
 set -e
@@ -139,6 +143,7 @@ do
 done < $RAW_OUT
 
 echo "Column extraction completed → $OUT"
+
 scripts/column_counts.sh
 #!/bin/bash
 
@@ -210,3 +215,136 @@ do
 done < $RAW_OUT
 
 echo "Oldest businessdat extraction completed → $OUT"
+
+
+
+scripts/schema_table_summary.sh
+
+#!/bin/bash
+
+INPUT="../output/schema_tables.csv"
+OUT="../output/summary_counts.txt"
+
+SCHEMA_COUNT=$(cut -d',' -f1 $INPUT | tail -n +2 | sort -u | wc -l)
+TABLE_COUNT=$(tail -n +2 $INPUT | wc -l)
+
+echo "Total Schemas: $SCHEMA_COUNT" > $OUT
+echo "Total Tables: $TABLE_COUNT" >> $OUT
+
+echo "Summary written → $OUT"
+
+
+input/businessdays.txt
+2024-01-01
+2024-02-01
+
+
+output/schema_tables.csv
+output/table_columns.csv
+input/businessdays.txt
+
+
+python generate_validation_sql.py
+impala-shell -k -i your-host -f ../logs/validation_queries.sql -B > ../logs/validation_raw.txt
+python parse_validation.py
+
+
+generate_validation_sql.py
+import csv
+import json
+
+columns_file = "../output/table_columns.csv"
+dates_file = "../input/businessdays.txt"
+sql_file = "../logs/validation_queries.sql"
+meta_file = "../logs/selected_columns.json"
+
+numeric_types = ("int", "bigint", "decimal", "double", "float", "smallint", "tinyint")
+
+# Read business days
+with open(dates_file) as f:
+    dates = [d.strip() for d in f if d.strip()]
+
+date_list = ",".join([f"'{d}'" for d in dates])
+
+tables = {}
+selected_map = {}
+
+# Collect numeric columns per table
+with open(columns_file) as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        dtype = row["data_type"].lower()
+        if any(dtype.startswith(nt) for nt in numeric_types):
+            key = f"{row['schema']}.{row['table']}"
+            tables.setdefault(key, []).append(row["column"])
+
+# Generate SQL
+with open(sql_file, "w") as out:
+    for table, cols in tables.items():
+        selected_cols = cols[:2]  # select only first 2 numeric columns
+        if not selected_cols:
+            continue
+
+        selected_map[table] = selected_cols
+
+        out.write(f"SELECT 'START:{table}';\n")
+
+        sum_expr = ", ".join([f"SUM({c}) AS {c}" for c in selected_cols])
+
+        out.write(f"""
+SELECT businessdat, COUNT(*) AS row_count, {sum_expr}
+FROM {table}
+WHERE businessdat IN ({date_list})
+GROUP BY businessdat;
+""")
+
+        out.write(f"SELECT 'END:{table}';\n")
+
+# Save selected columns
+with open(meta_file, "w") as m:
+    json.dump(selected_map, m)
+
+print("SQL generated.")
+
+
+parse_validation.py
+
+import csv
+import json
+
+raw_file = "../logs/validation_raw.txt"
+meta_file = "../logs/selected_columns.json"
+out_file = "../output/table_validation_metrics.csv"
+
+selected_map = json.load(open(meta_file))
+
+with open(out_file, "w", newline="") as out:
+    writer = csv.writer(out)
+    writer.writerow(["schema.table", "businessdat", "row_count", "checksum_column", "checksum_value"])
+
+    current_table = None
+
+    for line in open(raw_file):
+        line = line.strip()
+
+        if line.startswith("START:"):
+            current_table = line.split(":")[1]
+            continue
+
+        if line.startswith("END:"):
+            current_table = None
+            continue
+
+        if current_table and line:
+            parts = line.split()
+            business_day = parts[0]
+            row_count = parts[1]
+            values = parts[2:]
+
+            for col, val in zip(selected_map[current_table], values):
+                writer.writerow([current_table, business_day, row_count, col, val])
+
+print("Final validation file created.")
+
+
+
