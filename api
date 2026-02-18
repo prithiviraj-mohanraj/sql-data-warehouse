@@ -1,147 +1,212 @@
-Script to Generate Safe DESCRIBE Output
-scripts/03_extract_columns_raw.sh
+validation/
+├── input/
+│   └── schemas.txt
+├── scripts/
+│   └── extract_tables.sh
+├── output/
+└── logs/
+scripts/extract_tables.sh
 #!/bin/bash
+set -e
 
-SCOPE="../output/scope_summary.csv"
-SQL_FILE="../logs/describe_tables.sql"
-RAW_OUT="../logs/describe_raw.txt"
+SCHEMA_FILE="../input/schemas.txt"
+SQL_FILE="../logs/show_tables.sql"
+RAW_OUT="../logs/show_tables_raw.txt"
+OUT_TABLES="../output/schema_tables.csv"
+OUT_COUNTS="../output/schema_table_counts.csv"
 
-mkdir -p ../logs
+mkdir -p ../output ../logs
 
+echo "schema,table" > $OUT_TABLES
+echo "schema,total_tables" > $OUT_COUNTS
 > $SQL_FILE
 
-# Generate SQL with markers
-tail -n +2 $SCOPE | while IFS=',' read SCHEMA TABLE
+# --------------------------------------------
+# Step 1: Generate SQL with markers
+# --------------------------------------------
+while read SCHEMA
+do
+    echo "SELECT 'START:${SCHEMA}';" >> $SQL_FILE
+    echo "SHOW TABLES IN ${SCHEMA};" >> $SQL_FILE
+    echo "SELECT 'END:${SCHEMA}';" >> $SQL_FILE
+done < $SCHEMA_FILE
+
+# --------------------------------------------
+# Step 2: Run in ONE Impala session
+# --------------------------------------------
+impala-shell -k -i your-host -f $SQL_FILE -B > $RAW_OUT
+
+# --------------------------------------------
+# Step 3: Parse output
+# --------------------------------------------
+CURRENT_SCHEMA=""
+TABLE_COUNT=0
+
+while read LINE
+do
+    # Detect schema start
+    if [[ "$LINE" == START:* ]]; then
+        CURRENT_SCHEMA=${LINE#START:}
+        TABLE_COUNT=0
+        continue
+    fi
+
+    # Detect schema end → write count
+    if [[ "$LINE" == END:* ]]; then
+        echo "$CURRENT_SCHEMA,$TABLE_COUNT" >> $OUT_COUNTS
+        CURRENT_SCHEMA=""
+        continue
+    fi
+
+    # Capture table names
+    if [[ -n "$CURRENT_SCHEMA" && -n "$LINE" ]]; then
+        echo "$CURRENT_SCHEMA,$LINE" >> $OUT_TABLES
+        ((TABLE_COUNT++))
+    fi
+
+done < $RAW_OUT
+
+echo "Done."
+echo "Tables file → $OUT_TABLES"
+echo "Counts file → $OUT_COUNTS"
+scripts/extract_columns.sh
+#!/bin/bash
+set -e
+
+INPUT="../output/schema_tables.csv"
+SQL_FILE="../logs/describe_tables.sql"
+RAW_OUT="../logs/describe_raw.txt"
+OUT="../output/table_columns.csv"
+
+mkdir -p ../output ../logs
+
+echo "schema,table,column,data_type" > $OUT
+> $SQL_FILE
+
+# ---------------------------------------------------
+# Step 1: Generate SQL with table markers
+# ---------------------------------------------------
+tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE
 do
     echo "SELECT 'START:${SCHEMA}.${TABLE}';" >> $SQL_FILE
     echo "DESCRIBE ${SCHEMA}.${TABLE};" >> $SQL_FILE
     echo "SELECT 'END:${SCHEMA}.${TABLE}';" >> $SQL_FILE
 done
 
-# Run once (single connection)
+# ---------------------------------------------------
+# Step 2: Run once (single connection)
+# ---------------------------------------------------
 impala-shell -k -i your-host -f $SQL_FILE -B > $RAW_OUT
 
-echo "Raw describe output with table markers → $RAW_OUT"
+# ---------------------------------------------------
+# Step 3: Parse output safely
+# ---------------------------------------------------
+CURRENT_SCHEMA=""
+CURRENT_TABLE=""
 
+while read LINE
+do
+    LINE=$(echo "$LINE" | xargs)
 
-Option 1 — Parse Using Python (Recommended)
-scripts/parse_columns.py
-import csv
+    # Detect table start
+    if [[ "$LINE" == START:* ]]; then
+        TABLE_REF=${LINE#START:}
+        CURRENT_SCHEMA=${TABLE_REF%%.*}
+        CURRENT_TABLE=${TABLE_REF##*.}
+        continue
+    fi
 
-input_file = "../logs/describe_raw.txt"
-output_file = "../output/table_columns.csv"
+    # Detect table end
+    if [[ "$LINE" == END:* ]]; then
+        CURRENT_SCHEMA=""
+        CURRENT_TABLE=""
+        continue
+    fi
 
-with open(input_file) as f, open(output_file, "w", newline="") as out:
-    writer = csv.writer(out)
-    writer.writerow(["schema", "table", "column", "data_type"])
+    # Skip headers and empty lines
+    if [[ -z "$LINE" || "$LINE" == col_name* || "$LINE" == \#* ]]; then
+        continue
+    fi
 
-    current_schema = None
-    current_table = None
+    # Extract column & datatype
+    if [[ -n "$CURRENT_SCHEMA" ]]; then
+        COLUMN=$(echo "$LINE" | awk '{print $1}')
+        DATATYPE=$(echo "$LINE" | awk '{print $2}')
 
-    for line in f:
-        line = line.strip()
+        echo "$CURRENT_SCHEMA,$CURRENT_TABLE,$COLUMN,$DATATYPE" >> $OUT
+    fi
 
-        if line.startswith("START:"):
-            schema_table = line.split(":")[1]
-            current_schema, current_table = schema_table.split(".")
-            continue
+done < $RAW_OUT
 
-        if line.startswith("END:"):
-            current_schema = None
-            current_table = None
-            continue
+echo "Column extraction completed → $OUT"
+scripts/column_counts.sh
+#!/bin/bash
 
-        if current_schema and line and not line.startswith("#"):
-            parts = line.split()
-            if len(parts) >= 2:
-                writer.writerow([current_schema, current_table, parts[0], parts[1]])
+INPUT="../output/table_columns.csv"
+OUT="../output/column_counts.csv"
 
-print("Parsed column file created.")
+echo "schema,table,column_count" > $OUT
 
+tail -n +2 $INPUT | cut -d',' -f1,2 | sort | uniq -c | \
+awk '{print $2","$3","$1}' >> $OUT
 
-Option 2 — Parse Using AWK (If Python Not Allowed)
+echo "Column counts → $OUT"
+scripts/extract_oldest_businessdat.sh
+#!/bin/bash
+set -e
 
-awk '
-/START:/ {
-    split($0,a,":");
-    split(a[2],b,".");
-    schema=b[1]; table=b[2];
-    next;
-}
-/END:/ { schema=""; table=""; next; }
-NF>=2 && schema!="" && $1!="#" {
-    print schema","table","$1","$2;
-}
-' ../logs/describe_raw.txt > ../output/table_columns.csv
+INPUT="../output/schema_tables.csv"
+SQL_FILE="../logs/min_businessdat.sql"
+RAW_OUT="../logs/min_businessdat_raw.txt"
+OUT="../output/oldest_businessdat.csv"
 
-import csv
+mkdir -p ../output ../logs
 
-input_file = "../logs/describe_raw.txt"
-output_file = "../output/table_columns.csv"
+echo "schema.table,oldest_businessdat" > $OUT
+> $SQL_FILE
 
-with open(input_file) as f, open(output_file, "w", newline="") as out:
-    writer = csv.writer(out)
-    writer.writerow(["schema", "table", "column", "data_type", "column_type"])
+# ---------------------------------------------------
+# Step 1: Generate SQL with markers
+# ---------------------------------------------------
+tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE
+do
+    echo "SELECT 'START:${SCHEMA}.${TABLE}';" >> $SQL_FILE
+    echo "SELECT MIN(businessdat) FROM ${SCHEMA}.${TABLE};" >> $SQL_FILE
+    echo "SELECT 'END:${SCHEMA}.${TABLE}';" >> $SQL_FILE
+done
 
-    current_schema = None
-    current_table = None
-    column_type = "BASE"
+# ---------------------------------------------------
+# Step 2: Run in ONE Impala session
+# ---------------------------------------------------
+impala-shell -k -i your-host -f $SQL_FILE -B > $RAW_OUT
 
-    for line in f:
-        line = line.strip()
+# ---------------------------------------------------
+# Step 3: Parse output
+# ---------------------------------------------------
+CURRENT_TABLE=""
+VALUE=""
 
-        if line.startswith("START:"):
-            schema_table = line.split(":")[1]
-            current_schema, current_table = schema_table.split(".")
-            column_type = "BASE"
-            continue
+while read LINE
+do
+    LINE=$(echo "$LINE" | xargs)
 
-        if line.startswith("END:"):
-            current_schema = None
-            current_table = None
-            continue
+    if [[ "$LINE" == START:* ]]; then
+        CURRENT_TABLE=${LINE#START:}
+        continue
+    fi
 
-        # Detect partition section
-        if "Partition Information" in line:
-            column_type = "PARTITION"
-            continue
+    if [[ "$LINE" == END:* ]]; then
+        echo "$CURRENT_TABLE,$VALUE" >> $OUT
+        CURRENT_TABLE=""
+        VALUE=""
+        continue
+    fi
 
-        # Skip header lines
-        if line.startswith("#") or line.startswith("col_name"):
-            continue
+    # Capture MIN value
+    if [[ -n "$CURRENT_TABLE" && -n "$LINE" ]]; then
+        VALUE=$LINE
+    fi
 
-        if current_schema and line:
-            parts = line.split()
-            if len(parts) >= 2:
-                writer.writerow([
-                    current_schema,
-                    current_table,
-                    parts[0],
-                    parts[1],
-                    column_type
-                ])
+done < $RAW_OUT
 
-print("Partition-safe column file created.")
-
-Column Count Script (Python)
-
-import csv
-from collections import defaultdict
-
-counts = defaultdict(lambda: {"BASE":0, "PARTITION":0})
-
-with open("../output/table_columns.csv") as f:
-    reader = csv.DictReader(f)
-    for row in reader:
-        key = (row["schema"], row["table"])
-        counts[key][row["column_type"]] += 1
-
-with open("../output/column_counts.csv", "w", newline="") as out:
-    writer = csv.writer(out)
-    writer.writerow(["schema","table","base_columns","partition_columns","total_columns"])
-
-    for (schema, table), vals in counts.items():
-        total = vals["BASE"] + vals["PARTITION"]
-        writer.writerow([schema, table, vals["BASE"], vals["PARTITION"], total])
-
-print("Column counts created.")
+echo "Oldest businessdat extraction completed → $OUT"
