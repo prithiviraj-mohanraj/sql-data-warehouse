@@ -1,0 +1,175 @@
+You receive streaming events:
+
+event_id, user_id, event_time
+
+events = [
+    ("e1", "u1", "10:00"),
+    ("e2", "u2", "10:01"),
+    ("e1", "u1", "10:02"),  # duplicate
+    ("e3", "u3", "09:50"),  # late event -> drop
+]
+
+
+Assume current processing time = 10:05
+Watermark = 5 minutes → keep ≥ 10:00
+
+[
+ ('e1','u1','10:00'),
+ ('e2','u2','10:01')
+]
+
+
+from datetime import datetime, timedelta
+
+def deduplicate_events(events, current_time, watermark_minutes=5):
+    seen = set()
+    result = []
+
+    current = datetime.strptime(current_time, "%H:%M")
+    watermark = current - timedelta(minutes=watermark_minutes)
+
+    for event_id, user_id, event_time in events:
+        event_dt = datetime.strptime(event_time, "%H:%M")
+
+        # Drop late events
+        if event_dt < watermark:
+            continue
+
+        # Deduplicate
+        if event_id not in seen:
+            seen.add(event_id)
+            result.append((event_id, user_id, event_time))
+
+    return result
+
+print(deduplicate_events(events, "10:05"))
+
+
+Problem: Build User Sessions
+
+You have clickstream data.
+Create sessions where inactivity > 30 minutes starts a new session.
+
+🔹 Input
+user_id	timestamp
+u1	10:00
+u1	10:10
+u1	11:00
+u2	10:05
+u2	10:50
+
+
+
+
+
+
+| user | session_id | start | end   |
+| ---- | ---------- | ----- | ----- |
+| u1   | 1          | 10:00 | 10:10 |
+| u1   | 2          | 11:00 | 11:00 |
+| u2   | 1          | 10:05 | 10:05 |
+| u2   | 2          | 10:50 | 10:50 |
+
+
+
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, lag, unix_timestamp, sum
+from pyspark.sql.window import Window
+
+spark = SparkSession.builder.getOrCreate()
+
+data = [
+    ("u1", "2024-01-01 10:00:00"),
+    ("u1", "2024-01-01 10:10:00"),
+    ("u1", "2024-01-01 11:00:00"),
+    ("u2", "2024-01-01 10:05:00"),
+    ("u2", "2024-01-01 10:50:00"),
+]
+
+df = spark.createDataFrame(data, ["user_id", "timestamp"])
+
+w = Window.partitionBy("user_id").orderBy("timestamp")
+
+df2 = df.withColumn(
+    "prev_time",
+    lag("timestamp").over(w)
+)
+
+df3 = df2.withColumn(
+    "gap",
+    unix_timestamp("timestamp") - unix_timestamp("prev_time")
+)
+
+df4 = df3.withColumn(
+    "new_session",
+    (col("gap") > 1800) | col("gap").isNull()
+)
+
+df5 = df4.withColumn(
+    "session_id",
+    sum(col("new_session").cast("int")).over(w)
+)
+
+sessions = df5.groupBy("user_id", "session_id").agg(
+    {"timestamp": "min", "timestamp": "max"}
+)
+
+sessions.show()
+
+
+
+Problem: Find Service Downtime Periods
+
+You have system heartbeat logs.
+Each service sends a heartbeat every minute.
+
+If a heartbeat is missing for more than 5 minutes, it indicates downtime.
+
+📋 Table: heartbeats
+service_id	event_time
+
+
+service_id | event_time
+-----------+---------------------
+A          | 2024-01-01 10:00:00
+A          | 2024-01-01 10:01:00
+A          | 2024-01-01 10:02:00
+A          | 2024-01-01 10:10:00  -- gap
+A          | 2024-01-01 10:11:00
+B          | 2024-01-01 10:00:00
+B          | 2024-01-01 10:07:00  -- gap
+
+
+| service_id | down_from | down_to | gap_minutes |
+| ---------- | --------- | ------- | ----------- |
+| A          | 10:02     | 10:10   | 8           |
+| B          | 10:00     | 10:07   | 7           |
+
+
+
+WITH ordered AS (
+    SELECT
+        service_id,
+        event_time,
+        LAG(event_time) OVER (
+            PARTITION BY service_id
+            ORDER BY event_time
+        ) AS prev_time
+    FROM heartbeats
+),
+
+gaps AS (
+    SELECT
+        service_id,
+        prev_time AS down_from,
+        event_time AS down_to,
+        TIMESTAMPDIFF(MINUTE, prev_time, event_time) AS gap_minutes
+    FROM ordered
+    WHERE prev_time IS NOT NULL
+)
+
+SELECT *
+FROM gaps
+WHERE gap_minutes > 5
+ORDER BY service_id, down_from;
