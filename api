@@ -1,91 +1,42 @@
-filter_h_tables.sh
 
+identify_business_day_tables.sh
 #!/bin/bash
 
-INPUT="../output/schema_tables.csv"
-OUT="../output/schema_tables_h.csv"
+COL_FILE="../output/table_columns.csv"
+OUT="../logs/tables_with_business_day.csv"
 
 echo "schema,table" > $OUT
 
-tail -n +2 $INPUT | awk -F',' '$2 ~ /_h$/ {print}' >> $OUT
+grep -i ",business_day," $COL_FILE | cut -d',' -f1,2 | sort -u >> $OUT
 
-echo "Filtered _h tables → $OUT"
+echo "Tables with business_day → $OUT"
 
-extract_columns_h_tables.sh
-
+generate_metrics_sql.sh
 #!/bin/bash
-set -e
 
-INPUT="../output/schema_tables_h.csv"
-SQL_FILE="../logs/describe_h_tables.sql"
-RAW_OUT="../logs/describe_h_raw.txt"
-OUT="../output/table_columns_h.csv"
+INPUT="../logs/tables_with_business_day.csv"
+SQL_FILE="../logs/metrics_queries.sql"
 
-mkdir -p ../logs ../output
-
-echo "schema,table,column,data_type" > $OUT
 > $SQL_FILE
 
-# ---------------------------------------------------
-# Step 1: Generate SQL with markers
-# ---------------------------------------------------
 tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE
 do
-    echo "SELECT 'START:${SCHEMA}.${TABLE}';" >> $SQL_FILE
-    echo "DESCRIBE ${SCHEMA}.${TABLE};" >> $SQL_FILE
-    echo "SELECT 'END:${SCHEMA}.${TABLE}';" >> $SQL_FILE
+    echo "SELECT '${SCHEMA}.${TABLE}', MIN(business_day) FROM ${SCHEMA}.${TABLE};" >> $SQL_FILE
 done
 
-# ---------------------------------------------------
-# Step 2: Run single Impala session
-# ---------------------------------------------------
+echo "Metrics SQL generated → $SQL_FILE"
+
+run_metrics.sh
+#!/bin/bash
+
+SQL_FILE="../logs/metrics_queries.sql"
+RAW_OUT="../logs/metrics_raw.txt"
+OUT="../output/oldest_business_day.csv"
+
+echo "schema_table,oldest_business_day" > $OUT
+
 impala-shell -k -i your-host -f $SQL_FILE -B > $RAW_OUT
 
-# ---------------------------------------------------
-# Step 3: Parse output safely
-# ---------------------------------------------------
-CURRENT_SCHEMA=""
-CURRENT_TABLE=""
+awk -F'\t' 'NF>=2 {print $1","$2}' $RAW_OUT >> $OUT
 
-while IFS= read -r LINE
-do
-    LINE=$(echo "$LINE" | sed 's/^[ \t]*//;s/[ \t]*$//')
-
-    # Detect START
-    if [[ "$LINE" == START:* ]]; then
-        REF=${LINE#START:}
-        CURRENT_SCHEMA=${REF%%.*}
-        CURRENT_TABLE=${REF##*.}
-        continue
-    fi
-
-    # Detect END
-    if [[ "$LINE" == END:* ]]; then
-        CURRENT_SCHEMA=""
-        CURRENT_TABLE=""
-        continue
-    fi
-
-    # Skip headers & blank lines
-    if [[ -z "$LINE" || "$LINE" == col_name* || "$LINE" == \#* ]]; then
-        continue
-    fi
-
-    # Extract column safely
-    if [[ -n "$CURRENT_SCHEMA" ]]; then
-        COLUMN=$(echo "$LINE" | awk '{print $1}')
-        DATATYPE=$(echo "$LINE" | awk '{print $2}')
-
-        if [[ -n "$COLUMN" && -n "$DATATYPE" ]]; then
-            echo "$CURRENT_SCHEMA,$CURRENT_TABLE,$COLUMN,$DATATYPE" >> $OUT
-        fi
-    fi
-
-done < "$RAW_OUT"
-
-echo "Column extraction completed → $OUT"
-
-
-
-
-
+echo "Oldest business day file → $OUT"
