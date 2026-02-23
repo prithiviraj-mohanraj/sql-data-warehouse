@@ -1,42 +1,185 @@
-
-identify_business_day_tables.sh
+scripts/generate_counts_sql.sh
 #!/bin/bash
 
-COL_FILE="../output/table_columns.csv"
-OUT="../logs/tables_with_business_day.csv"
-
-echo "schema,table" > $OUT
-
-grep -i ",business_day," $COL_FILE | cut -d',' -f1,2 | sort -u >> $OUT
-
-echo "Tables with business_day → $OUT"
-
-generate_metrics_sql.sh
-#!/bin/bash
-
-INPUT="../logs/tables_with_business_day.csv"
-SQL_FILE="../logs/metrics_queries.sql"
+TABLES="../logs/tables_with_business_day.csv"
+DATES_FILE="../input/business_days.txt"
+SQL_FILE="../logs/count_queries.sql"
 
 > $SQL_FILE
 
-tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE
+DATES=$(paste -sd"," $DATES_FILE | sed "s/,/','/g")
+
+tail -n +2 $TABLES | while IFS=',' read SCHEMA TABLE
 do
-    echo "SELECT '${SCHEMA}.${TABLE}', MIN(business_day) FROM ${SCHEMA}.${TABLE};" >> $SQL_FILE
+    echo "SELECT '${SCHEMA}','${TABLE}', business_day, COUNT(*) 
+          FROM ${SCHEMA}.${TABLE}
+          WHERE business_day IN ('$DATES')
+          GROUP BY business_day;" >> $SQL_FILE
 done
 
-echo "Metrics SQL generated → $SQL_FILE"
+echo "Count queries generated → $SQL_FILE"
 
-run_metrics.sh
+scripts/run_counts.sh
+
 #!/bin/bash
 
-SQL_FILE="../logs/metrics_queries.sql"
-RAW_OUT="../logs/metrics_raw.txt"
-OUT="../output/oldest_business_day.csv"
+SQL_FILE="../logs/count_queries.sql"
+RAW_OUT="../logs/counts_raw.txt"
+OUT="../output/business_day_counts.csv"
 
-echo "schema_table,oldest_business_day" > $OUT
+echo "schema,table,business_day,record_count" > $OUT
 
 impala-shell -k -i your-host -f $SQL_FILE -B > $RAW_OUT
 
-awk -F'\t' 'NF>=2 {print $1","$2}' $RAW_OUT >> $OUT
+awk -F'\t' 'NF>=4 {print $1","$2","$3","$4}' $RAW_OUT >> $OUT
 
-echo "Oldest business day file → $OUT"
+echo "Business day counts → $OUT"
+
+
+
+scripts/identify_numeric_columns.sh
+
+#!/bin/bash
+
+COL_FILE="../output/table_columns.csv"
+OUT="../logs/numeric_columns.csv"
+
+echo "schema,table,column" > $OUT
+
+grep -Ei ',(int|bigint|double|float|decimal)' $COL_FILE | cut -d',' -f1,2,3 >> $OUT
+
+echo "Numeric columns → $OUT"
+
+scripts/generate_sum_sql.sh
+#!/bin/bash
+
+INPUT="../logs/numeric_columns.csv"
+SQL_FILE="../logs/sum_queries.sql"
+
+> $SQL_FILE
+
+tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE COLUMN
+do
+    echo "SELECT '${SCHEMA}','${TABLE}','${COLUMN}', SUM(${COLUMN}) 
+          FROM ${SCHEMA}.${TABLE};" >> $SQL_FILE
+done
+
+echo "SUM queries generated → $SQL_FILE"
+
+scripts/run_sums.sh
+#!/bin/bash
+
+SQL_FILE="../logs/sum_queries.sql"
+RAW_OUT="../logs/sums_raw.txt"
+OUT="../output/numeric_sums.csv"
+
+echo "schema,table,column,sum_value" > $OUT
+
+impala-shell -k -i your-host -f $SQL_FILE -B > $RAW_OUT
+
+awk -F'\t' 'NF>=4 {print $1","$2","$3","$4}' $RAW_OUT >> $OUT
+
+echo "Numeric sums → $OUT"
+
+
+
+
+import pandas as pd
+
+schemas = pd.read_csv("schemas.txt", header=None, names=["schema"])
+cloudera_tables = pd.read_csv("cloudera_tables.csv")
+cloudera_columns = pd.read_csv("cloudera_columns.csv")
+
+
+sf_schemas = session.sql("SHOW SCHEMAS").to_pandas()
+
+sf_schemas['name'] = sf_schemas['name'].str.lower()
+schemas['schema'] = schemas['schema'].str.lower()
+
+schema_validation = schemas.merge(
+    sf_schemas[['name']],
+    left_on='schema',
+    right_on='name',
+    how='left',
+    indicator=True
+)
+
+schema_validation['exists_in_snowflake'] = schema_validation['_merge'] == 'both'
+schema_validation = schema_validation[['schema','exists_in_snowflake']]
+
+schema_validation
+
+STEP 3 — Get Snowflake Tables (Only Relevant Schemas)
+
+schema_list = "','".join(schemas['schema'])
+
+sf_tables = session.sql(f"""
+SELECT table_schema, table_name
+FROM information_schema.tables
+WHERE table_schema IN ('{schema_list}')
+""").to_pandas()
+
+sf_tables['table_schema'] = sf_tables['table_schema'].str.lower()
+sf_tables['table_name'] = sf_tables['table_name'].str.lower()
+
+sf_tables_h = sf_tables[sf_tables['table_name'].str.endswith('_h')]
+
+STEP 5 — Compare Tables (Cloudera vs Snowflake)
+cloudera_tables['schema'] = cloudera_tables['schema'].str.lower()
+cloudera_tables['table'] = cloudera_tables['table'].str.lower()
+
+table_validation = cloudera_tables.merge(
+    sf_tables_h,
+    left_on=['schema','table'],
+    right_on=['table_schema','table_name'],
+    how='left',
+    indicator=True
+)
+
+table_validation['exists_in_snowflake'] = table_validation['_merge'] == 'both'
+table_validation = table_validation[['schema','table','exists_in_snowflake']]
+
+table_validation
+
+sf_columns = session.sql(f"""
+SELECT table_schema, table_name, column_name, data_type
+FROM information_schema.columns
+WHERE table_schema IN ('{schema_list}')
+""").to_pandas()
+
+sf_columns = sf_columns.apply(lambda col: col.str.lower() if col.dtype == "object" else col)
+
+
+
+cloudera_columns = cloudera_columns.apply(lambda col: col.str.lower() if col.dtype == "object" else col)
+
+column_compare = cloudera_columns.merge(
+    sf_columns,
+    left_on=['schema','table','column'],
+    right_on=['table_schema','table_name','column_name'],
+    how='left',
+    indicator=True
+)
+
+column_compare['column_exists'] = column_compare['_merge'] == 'both'
+column_compare['datatype_match'] = column_compare['data_type_x'] == column_compare['data_type_y']
+
+column_compare = column_compare[[
+    'schema','table','column','data_type_x','data_type_y',
+    'column_exists','datatype_match'
+]]
+
+column_compare.rename(columns={
+    'data_type_x':'cloudera_type',
+    'data_type_y':'snowflake_type'
+}, inplace=True)
+
+column_compare
+
+
+
+
+schema_validation.to_csv("schema_validation.csv", index=False)
+table_validation.to_csv("table_validation.csv", index=False)
+column_compare.to_csv("column_validation.csv", index=False)
+
