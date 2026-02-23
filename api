@@ -1,94 +1,40 @@
-import pandas as pd
 
-schemas = pd.read_csv("schemas.txt", header=None, names=["schema"])
-cloudera_tables = pd.read_csv("cloudera_tables.csv")
-cloudera_columns = pd.read_csv("cloudera_columns.csv")
-sf_schemas = session.sql("SHOW SCHEMAS").to_pandas()
-sf_schemas['name'] = sf_schemas['name'].str.lower()
+SELECT 'sales','orders','2024-01-01', COUNT(*)
+FROM sales.orders
+WHERE business_day = '2024-01-01';
 
-schemas['schema'] = schemas['schema'].str.lower()
+generate_counts_sql.sh
+#!/bin/bash
 
-schema_validation = schemas.merge(
-    sf_schemas[['name']],
-    left_on='schema',
-    right_on='name',
-    how='left',
-    indicator=True
-)
+TABLES="../logs/tables_with_business_day.csv"
+DATES_FILE="../input/business_days.txt"
+SQL_FILE="../logs/count_queries.sql"
 
-schema_validation['exists_in_snowflake'] = schema_validation['_merge'] == 'both'
-schema_validation = schema_validation[['schema','exists_in_snowflake']]
+> $SQL_FILE
 
-schema_validation
-results = []
+tail -n +2 $TABLES | while IFS=',' read SCHEMA TABLE
+do
+    while read DATE
+    do
+        echo "SELECT '${SCHEMA}','${TABLE}','${DATE}', COUNT(*) 
+              FROM ${SCHEMA}.${TABLE}
+              WHERE business_day='${DATE}';" >> $SQL_FILE
+    done < $DATES_FILE
+done
 
-for schema in schemas['schema']:
-    try:
-        df = session.sql(f"SHOW TABLES IN SCHEMA prod.{schema}").to_pandas()
-        df['schema'] = schema
-        results.append(df[['schema','name']])
-    except:
-        pass
+echo "Queries generated → $SQL_FILE"
 
-sf_tables = pd.concat(results, ignore_index=True)
-sf_tables['name'] = sf_tables['name'].str.lower()
-sf_tables_h = sf_tables[sf_tables['name'].str.endswith('_h')]
+run_counts.sh
+#!/bin/bash
 
-cloudera_tables = cloudera_tables.apply(lambda col: col.str.lower() if col.dtype=="object" else col)
+SQL_FILE="../logs/count_queries.sql"
+RAW_OUT="../logs/counts_raw.txt"
+OUT="../output/business_day_counts.csv"
 
-table_validation = cloudera_tables.merge(
-    sf_tables_h,
-    left_on=['schema','table'],
-    right_on=['schema','name'],
-    how='left',
-    indicator=True
-)
+echo "schema,table,business_day,record_count" > $OUT
 
-table_validation['exists_in_snowflake'] = table_validation['_merge'] == 'both'
-table_validation = table_validation[['schema','table','exists_in_snowflake']]
+impala-shell -k -i your-host -f $SQL_FILE -B > $RAW_OUT
 
-table_validation
+awk -F'\t' 'NF>=4 {print $1","$2","$3","$4}' $RAW_OUT >> $OUT
 
-column_results = []
-
-for _, row in cloudera_tables.iterrows():
-    schema = row['schema']
-    table = row['table']
-    try:
-        df = session.sql(f"SHOW COLUMNS IN TABLE prod.{schema}.{table}").to_pandas()
-        df['schema'] = schema
-        df['table'] = table
-        column_results.append(df[['schema','table','column_name','data_type']])
-    except:
-        pass
-
-sf_columns = pd.concat(column_results, ignore_index=True)
-sf_columns = sf_columns.apply(lambda col: col.str.lower() if col.dtype=="object" else col)
-
-cloudera_columns = cloudera_columns.apply(lambda col: col.str.lower() if col.dtype=="object" else col)
-
-column_compare = cloudera_columns.merge(
-    sf_columns,
-    left_on=['schema','table','column'],
-    right_on=['schema','table','column_name'],
-    how='left',
-    indicator=True
-)
-
-column_compare['column_exists'] = column_compare['_merge'] == 'both'
-column_compare['datatype_match'] = column_compare['data_type_x'] == column_compare['data_type_y']
-
-column_compare = column_compare[[
-    'schema','table','column','data_type_x','data_type_y',
-    'column_exists','datatype_match'
-]]
-
-column_compare.rename(columns={
-    'data_type_x':'cloudera_type',
-    'data_type_y':'snowflake_type'
-}, inplace=True)
-
-column_compare
-schema_validation.to_csv("schema_validation.csv", index=False)
-table_validation.to_csv("table_validation.csv", index=False)
-column_compare.to_csv("column_validation.csv", index=False)
+echo "Counts file → $OUT"
