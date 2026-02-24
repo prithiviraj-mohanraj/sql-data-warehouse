@@ -120,4 +120,15 @@ def extract_precision(dtype):
         return match.group(1), match.group(2)
     return None, None
 
-
+I worked on the Cloudera to Snowflake validation.
+On the Snowflake side, I validated schema presence and identified schemas that exist in Cloudera but are missing in Snowflake.
+I also validated tables from our scope and identified tables that are present in Cloudera but not in Snowflake.
+At the column level, I compared structures and found columns that are missing in Snowflake as well as extra columns present in Snowflake compared to Cloudera.
+Additionally, I counted records for one business day across all applicable tables in Snowflake to validate data completeness.
+Current work:
+I’m currently working on datatype validation. Since Snowflake uses types like NUMBER, DECIMAL, VARCHAR, etc., and Cloudera uses different representations, a direct comparison can give false mismatches.
+So I’m building a datatype mapping to normalize types and classify them as match, compatible, or true mismatch.
+Clarification / Question:
+I also noticed that Snowflake has extra columns compared to Cloudera.
+I wanted to confirm whether these additional columns — such as audit or metadata fields — should be considered acceptable, or if we need to flag them as discrepancies.
+Similarly, if there are extra tables in Snowflake that are not part of the migration scope, should we ignore them or include them in validation?
