@@ -1,40 +1,86 @@
+import pandas as pd
 
-SELECT 'sales','orders','2024-01-01', COUNT(*)
-FROM sales.orders
-WHERE business_day = '2024-01-01';
+scope = pd.read_csv("scope_summary.csv")
+cloudera_columns = pd.read_csv("table_columns.csv")
 
-generate_counts_sql.sh
-#!/bin/bash
+scope = scope.apply(lambda c: c.str.lower() if c.dtype=="object" else c)
+cloudera_columns = cloudera_columns.apply(lambda c: c.str.lower() if c.dtype=="object" else c)
 
-TABLES="../logs/tables_with_business_day.csv"
-DATES_FILE="../input/business_days.txt"
-SQL_FILE="../logs/count_queries.sql"
+schemas = scope['schema'].unique().tolist()
 
-> $SQL_FILE
+sf_tables_list = []
 
-tail -n +2 $TABLES | while IFS=',' read SCHEMA TABLE
-do
-    while read DATE
-    do
-        echo "SELECT '${SCHEMA}','${TABLE}','${DATE}', COUNT(*) 
-              FROM ${SCHEMA}.${TABLE}
-              WHERE business_day='${DATE}';" >> $SQL_FILE
-    done < $DATES_FILE
-done
+for schema in schemas:
+    try:
+        df = session.sql(f"SHOW TABLES IN SCHEMA prod.{schema}").to_pandas()
+        df['schema'] = schema
+        sf_tables_list.append(df[['schema','name']])
+    except:
+        pass
 
-echo "Queries generated → $SQL_FILE"
+sf_tables = pd.concat(sf_tables_list, ignore_index=True)
+sf_tables.rename(columns={'name':'table'}, inplace=True)
+sf_tables['table'] = sf_tables['table'].str.lower()
 
-run_counts.sh
-#!/bin/bash
+table_compare = scope.merge(
+    sf_tables,
+    on=['schema','table'],
+    how='left',
+    indicator=True
+)
 
-SQL_FILE="../logs/count_queries.sql"
-RAW_OUT="../logs/counts_raw.txt"
-OUT="../output/business_day_counts.csv"
+table_compare['exists_in_snowflake'] = table_compare['_merge'] == 'both'
+table_compare = table_compare[['schema','table','exists_in_snowflake']]
 
-echo "schema,table,business_day,record_count" > $OUT
 
-impala-shell -k -i your-host -f $SQL_FILE -B > $RAW_OUT
+cloudera_counts = scope.groupby('schema').size().reset_index(name='cloudera_table_count')
 
-awk -F'\t' 'NF>=4 {print $1","$2","$3","$4}' $RAW_OUT >> $OUT
 
-echo "Counts file → $OUT"
+
+sf_counts = table_compare[table_compare['exists_in_snowflake']] \
+    .groupby('schema').size().reset_index(name='snowflake_table_count')
+
+schema_summary = cloudera_counts.merge(sf_counts, on='schema', how='left').fillna(0)
+schema_summary['missing_tables'] = schema_summary['cloudera_table_count'] - schema_summary['snowflake_table_count']
+
+schema_summary
+sf_columns_list = []
+
+for _, row in table_compare.iterrows():
+    if row['exists_in_snowflake']:
+        schema = row['schema']
+        table = row['table']
+        try:
+            df = session.sql(f"SHOW COLUMNS IN TABLE prod.{schema}.{table}").to_pandas()
+            df['schema'] = schema
+            df['table'] = table
+            sf_columns_list.append(df[['schema','table','column_name']])
+        except:
+            pass
+
+sf_columns = pd.concat(sf_columns_list, ignore_index=True)
+sf_columns.rename(columns={'column_name':'column'}, inplace=True)
+sf_columns = sf_columns.apply(lambda c: c.str.lower() if c.dtype=="object" else c)
+
+cloudera_col_counts = cloudera_columns.groupby(['schema','table']).size().reset_index(name='cloudera_column_count')
+sf_col_counts = sf_columns.groupby(['schema','table']).size().reset_index(name='snowflake_column_count')
+
+column_summary = table_compare.merge(cloudera_col_counts, on=['schema','table'], how='left') \
+    .merge(sf_col_counts, on=['schema','table'], how='left')
+
+column_summary['snowflake_column_count'] = column_summary['snowflake_column_count'].fillna(0)
+column_summary['column_mismatch'] = column_summary['cloudera_column_count'] != column_summary['snowflake_column_count']
+
+column_summary
+
+missing_columns = cloudera_columns.merge(
+    sf_columns,
+    on=['schema','table','column'],
+    how='left',
+    indicator=True
+)
+
+missing_columns = missing_columns[missing_columns['_merge'] == 'left_only']
+missing_columns = missing_columns[['schema','table','column']]
+
+missing_columns
