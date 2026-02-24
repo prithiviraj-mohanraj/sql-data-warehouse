@@ -1,95 +1,105 @@
-
-
-import pandas as pd
-
-schemas = pd.read_csv("schemas.txt", header=None, names=["schema"])
-cloudera_tables = pd.read_csv("schemas_tables.csv")
-cloudera_columns = pd.read_csv("table_columns.csv")
-
-# normalize
-for df in [schemas, cloudera_tables, cloudera_columns]:
-    for col in df.columns:
-        if df[col].dtype == "object":
-            df[col] = df[col].str.lower()
-sf_schemas = session.sql("SHOW SCHEMAS").to_pandas()
-sf_schemas['name'] = sf_schemas['name'].str.lower()
-
-schema_validation = schemas.merge(
-    sf_schemas[['name']],
-    left_on='schema',
-    right_on='name',
+tables_missing_in_sf = cloudera_tables.merge(
+    sf_tables_h,
+    left_on=['schema','table'],
+    right_on=['schema','name'],
     how='left',
     indicator=True
 )
 
-schema_validation['exists_in_snowflake'] = schema_validation['_merge'] == 'both'
+tables_missing_in_sf = tables_missing_in_sf[
+    tables_missing_in_sf['_merge'] == 'left_only'
+][['schema','table']]
 
-schema_validation = schema_validation[['schema','exists_in_snowflake']]
-schema_validation
-sf_tables_list = []
-
-for schema in schemas['schema']:
-    try:
-        df = session.sql(f"SHOW TABLES IN SCHEMA prod.{schema}").to_pandas()
-        df['schema'] = schema
-        sf_tables_list.append(df[['schema','name']])
-    except:
-        pass
-
-sf_tables = pd.concat(sf_tables_list, ignore_index=True)
-sf_tables['name'] = sf_tables['name'].str.lower()
-
-cloudera_table_counts = cloudera_tables.groupby('schema').size().reset_index(name='cloudera_table_count')
-
-sf_tables_h = sf_tables[sf_tables['name'].str.endswith('_h')]
-
-sf_table_counts = sf_tables_h.groupby('schema').size().reset_index(name='snowflake_table_count')
-
-matching_tables = cloudera_tables.merge(
-    sf_tables_h,
-    left_on=['schema','table'],
-    right_on=['schema','name'],
-    how='inner'
+tables_missing_in_sf
+columns_missing_in_sf = cloudera_columns.merge(
+    sf_columns,
+    left_on=['schema','table','column'],
+    right_on=['schema','table','column_name'],
+    how='left',
+    indicator=True
 )
 
-matching_counts = matching_tables.groupby('schema').size().reset_index(name='matching_tables')
+columns_missing_in_sf = columns_missing_in_sf[
+    columns_missing_in_sf['_merge'] == 'left_only'
+][['schema','table','column']]
 
-table_summary = cloudera_table_counts.merge(sf_table_counts, on='schema', how='left')
-table_summary = table_summary.merge(matching_counts, on='schema', how='left')
+columns_missing_in_sf
 
-table_summary.fillna(0, inplace=True)
-table_summary
-
-cloudera_col_counts = cloudera_columns.groupby(['schema','table']).size().reset_index(name='cloudera_column_count')
-
-sf_column_list = []
-
-for _, row in cloudera_tables.iterrows():
-    schema = row['schema']
-    table = row['table']
-    try:
-        df = session.sql(f"SHOW COLUMNS IN TABLE prod.{schema}.{table}").to_pandas()
-        df['schema'] = schema
-        df['table'] = table
-        sf_column_list.append(df[['schema','table','column_name']])
-    except:
-        pass
-
-sf_columns = pd.concat(sf_column_list, ignore_index=True)
-sf_columns = sf_columns.apply(lambda col: col.str.lower() if col.dtype == "object" else col)
-
-sf_col_counts = sf_columns.groupby(['schema','table']).size().reset_index(name='snowflake_column_count')
-
-column_comparison = cloudera_col_counts.merge(
-    sf_col_counts,
-    on=['schema','table'],
-    how='left'
+extra_columns_in_sf = sf_columns.merge(
+    cloudera_columns,
+    left_on=['schema','table','column_name'],
+    right_on=['schema','table','column'],
+    how='left',
+    indicator=True
 )
 
-column_comparison['column_count_match'] = (
-    column_comparison['cloudera_column_count'] == column_comparison['snowflake_column_count']
-)
+extra_columns_in_sf = extra_columns_in_sf[
+    extra_columns_in_sf['_merge'] == 'left_only'
+][['schema','table','column_name']]
 
-column_comparison.fillna(0, inplace=True)
+extra_columns_in_sf.rename(columns={'column_name':'column'}, inplace=True)
+
+extra_columns_in_sf
+
 column_comparison
 
+
+column_diff_summary = column_comparison.copy()
+
+column_diff_summary['difference_reason'] = column_diff_summary['column_count_match'].apply(
+    lambda x: "Match" if x else "Mismatch — check missing/extra columns"
+)
+
+column_diff_summary
+
+tables_missing_in_sf.to_csv("tables_missing_in_snowflake.csv", index=False)
+columns_missing_in_sf.to_csv("columns_missing_in_snowflake.csv", index=False)
+extra_columns_in_sf.to_csv("extra_columns_in_snowflake.csv", index=False)
+
+tables_with_business_day_sf = sf_columns[
+    sf_columns['column_name'] == 'business_day'
+][['schema','table']].drop_duplicates()
+
+tables_with_business_day_sf
+
+
+oldest_dates = []
+
+for _, row in tables_with_business_day_sf.iterrows():
+    schema = row['schema']
+    table = row['table']
+
+    try:
+        df = session.sql(
+            f"SELECT MIN(business_day) AS oldest_business_day FROM prod.{schema}.{table}"
+        ).to_pandas()
+
+        oldest_dates.append({
+            "schema": schema,
+            "table": table,
+            "oldest_business_day": df.iloc[0,0]
+        })
+
+    except Exception as e:
+        print(f"Skipped {schema}.{table}: {e}")
+
+oldest_business_day_df = pd.DataFrame(oldest_dates)
+oldest_business_day_df
+
+cloudera_oldest = pd.read_csv("cloudera_oldest_business_day.csv")
+
+oldest_compare = cloudera_oldest.merge(
+    oldest_business_day_df,
+    on=['schema','table'],
+    how='outer',
+    suffixes=('_cloudera','_snowflake')
+)
+
+oldest_compare['match'] = (
+    oldest_compare['oldest_business_day_cloudera'] ==
+    oldest_compare['oldest_business_day_snowflake']
+)
+
+oldest_compare
+
+oldest_business_day_df.to_csv("snowflake_oldest_business_day.csv", index=False)
