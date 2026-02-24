@@ -1,105 +1,123 @@
-tables_missing_in_sf = cloudera_tables.merge(
-    sf_tables_h,
-    left_on=['schema','table'],
-    right_on=['schema','name'],
-    how='left',
-    indicator=True
+cloudera_df = cloudera_oldest_business_day_df.rename(
+    columns={"oldest_business_day": "cloudera_oldest"}
 )
 
-tables_missing_in_sf = tables_missing_in_sf[
-    tables_missing_in_sf['_merge'] == 'left_only'
-][['schema','table']]
+snowflake_df = oldest_business_day_df.rename(
+    columns={"oldest_business_day": "snowflake_oldest"}
+)
 
-tables_missing_in_sf
-columns_missing_in_sf = cloudera_columns.merge(
+oldest_compare_df = cloudera_df.merge(
+    snowflake_df,
+    on=['schema','table'],
+    how='outer'
+)
+
+oldest_compare_df['match'] = (
+    oldest_compare_df['cloudera_oldest'] ==
+    oldest_compare_df['snowflake_oldest']
+)
+
+oldest_mismatch_df = oldest_compare_df[
+    oldest_compare_df['match'] == False
+]
+
+oldest_mismatch_df
+
+missing_oldest_df = oldest_compare_df[
+    oldest_compare_df['cloudera_oldest'].isna() |
+    oldest_compare_df['snowflake_oldest'].isna()
+]
+
+
+
+
+def normalize_type(dtype: str) -> str:
+    if dtype is None:
+        return None
+
+    dtype = dtype.lower()
+
+    # remove precision
+    base = dtype.split("(")[0]
+
+    mapping = {
+        "string": "string",
+        "varchar": "string",
+        "char": "string",
+        "text": "string",
+
+        "int": "number",
+        "bigint": "number",
+        "smallint": "number",
+        "tinyint": "number",
+        "number": "number",
+
+        "double": "float",
+        "float": "float",
+
+        "decimal": "decimal",
+        "numeric": "decimal",
+
+        "boolean": "boolean",
+        "date": "date",
+        "timestamp": "timestamp",
+        "timestamp_ntz": "timestamp",
+        "timestamp_ltz": "timestamp",
+    }
+
+    return mapping.get(base, base)
+
+
+cloudera_columns['normalized_type'] = cloudera_columns['data_type'].apply(normalize_type)
+sf_columns['normalized_type'] = sf_columns['data_type'].apply(normalize_type)
+
+
+datatype_compare = cloudera_columns.merge(
     sf_columns,
     left_on=['schema','table','column'],
     right_on=['schema','table','column_name'],
     how='left',
-    indicator=True
-)
-
-columns_missing_in_sf = columns_missing_in_sf[
-    columns_missing_in_sf['_merge'] == 'left_only'
-][['schema','table','column']]
-
-columns_missing_in_sf
-
-extra_columns_in_sf = sf_columns.merge(
-    cloudera_columns,
-    left_on=['schema','table','column_name'],
-    right_on=['schema','table','column'],
-    how='left',
-    indicator=True
-)
-
-extra_columns_in_sf = extra_columns_in_sf[
-    extra_columns_in_sf['_merge'] == 'left_only'
-][['schema','table','column_name']]
-
-extra_columns_in_sf.rename(columns={'column_name':'column'}, inplace=True)
-
-extra_columns_in_sf
-
-column_comparison
-
-
-column_diff_summary = column_comparison.copy()
-
-column_diff_summary['difference_reason'] = column_diff_summary['column_count_match'].apply(
-    lambda x: "Match" if x else "Mismatch — check missing/extra columns"
-)
-
-column_diff_summary
-
-tables_missing_in_sf.to_csv("tables_missing_in_snowflake.csv", index=False)
-columns_missing_in_sf.to_csv("columns_missing_in_snowflake.csv", index=False)
-extra_columns_in_sf.to_csv("extra_columns_in_snowflake.csv", index=False)
-
-tables_with_business_day_sf = sf_columns[
-    sf_columns['column_name'] == 'business_day'
-][['schema','table']].drop_duplicates()
-
-tables_with_business_day_sf
-
-
-oldest_dates = []
-
-for _, row in tables_with_business_day_sf.iterrows():
-    schema = row['schema']
-    table = row['table']
-
-    try:
-        df = session.sql(
-            f"SELECT MIN(business_day) AS oldest_business_day FROM prod.{schema}.{table}"
-        ).to_pandas()
-
-        oldest_dates.append({
-            "schema": schema,
-            "table": table,
-            "oldest_business_day": df.iloc[0,0]
-        })
-
-    except Exception as e:
-        print(f"Skipped {schema}.{table}: {e}")
-
-oldest_business_day_df = pd.DataFrame(oldest_dates)
-oldest_business_day_df
-
-cloudera_oldest = pd.read_csv("cloudera_oldest_business_day.csv")
-
-oldest_compare = cloudera_oldest.merge(
-    oldest_business_day_df,
-    on=['schema','table'],
-    how='outer',
     suffixes=('_cloudera','_snowflake')
 )
 
-oldest_compare['match'] = (
-    oldest_compare['oldest_business_day_cloudera'] ==
-    oldest_compare['oldest_business_day_snowflake']
-)
 
-oldest_compare
+def classify_datatype(row):
+    if pd.isna(row['normalized_type_snowflake']):
+        return "MISSING_IN_SNOWFLAKE"
 
-oldest_business_day_df.to_csv("snowflake_oldest_business_day.csv", index=False)
+    if row['normalized_type_cloudera'] == row['normalized_type_snowflake']:
+        return "MATCH"
+
+    # Compatible cases
+    compatible_pairs = [
+        ("decimal", "number"),
+        ("number", "decimal"),
+    ]
+
+    if (row['normalized_type_cloudera'], row['normalized_type_snowflake']) in compatible_pairs:
+        return "COMPATIBLE"
+
+    return "MISMATCH"
+
+datatype_compare['datatype_status'] = datatype_compare.apply(classify_datatype, axis=1)
+
+datatype_mismatches = datatype_compare[
+    datatype_compare['datatype_status'] == "MISMATCH"
+]
+
+datatype_mismatches
+
+datatype_compatible = datatype_compare[
+    datatype_compare['datatype_status'] == "COMPATIBLE"
+]
+
+
+import re
+
+def extract_precision(dtype):
+    match = re.search(r'\((\d+),?(\d+)?\)', str(dtype))
+    if match:
+        return match.group(1), match.group(2)
+    return None, None
+
+
