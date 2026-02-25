@@ -1,134 +1,107 @@
-cloudera_df = cloudera_oldest_business_day_df.rename(
-    columns={"oldest_business_day": "cloudera_oldest"}
-)
+Opening — Context
+“Today I’ll walk you through the validation framework we built to reconcile Cloudera and Snowflake as part of the migration.
+The goal is to ensure that only the scoped schemas and tables provided by the vendor are correctly migrated, structurally consistent, and data complete.”
+🔹 2. Scope Control — Why We Filtered
+“One key challenge was that Snowflake contains around 180 schemas and Cloudera contains thousands of tables, but our migration scope includes only 24 schemas and 84 tables.
+So the first thing I implemented was scope-driven validation.
+All checks are restricted to schemas and tables listed in the input files, avoiding unnecessary scans and ensuring production safety.”
+🔹 3. What Has Been Completed
+✅ Schema Validation
+“We validated that all schemas present in Cloudera are also present in Snowflake and identified any missing schemas.”
+👉 Outcome:
+Clear list of schemas missing in Snowflake.
+✅ Table Validation
+“We compared tables from the migration scope and identified tables present in Cloudera but missing in Snowflake.”
+👉 Outcome:
+Clear list of missing tables for remediation.
+✅ Column Validation
+“We extracted column names and datatypes from both systems and performed structural comparisons.”
+We identified:
+Missing columns in Snowflake
+Extra columns in Snowflake
+Column count mismatches
+👉 This helped explain why some tables had higher column counts in Snowflake.
+✅ Datatype Validation (Normalized Comparison)
+“Since Cloudera and Snowflake use different datatype systems, we implemented datatype normalization.
+For example:
+string vs varchar → treated as match
+int vs number → treated as match
+decimal vs number → treated as compatible
+This avoids false mismatches and highlights only real issues.”
+👉 Outcome:
+Exact count of true datatype mismatches
+Compatible differences flagged separately
+✅ Data Completeness Validation
+“We validated data completeness using business_day.”
+Completed checks:
+Oldest business day per table
+Record counts for selected business days
+Identification of tables with missing historical data
+👉 Outcome:
+Detection of partial loads or missing history
+🔹 4. What I Am Working On Now
+“Currently, I am enhancing data validation using checksum-style comparisons.
+The idea is to compute aggregates such as counts and sums to ensure data consistency between Cloudera and Snowflake.”
+🔹 5. Checksum Strategy — Current Approach
+“My current approach is:
+Use business_day as the primary partition filter.
+For each table, select the first one or two numeric columns.
+Compute aggregate values like SUM for those columns.
+Store which columns were used for checksum in the output.
+This allows us to:
+Validate data accuracy without scanning entire tables
+Ensure the same columns are used for Snowflake validation
+Provide traceability by documenting checksum columns used”
 
-snowflake_df = oldest_business_day_df.rename(
-    columns={"oldest_business_day": "snowflake_oldest"}
-)
-
-oldest_compare_df = cloudera_df.merge(
-    snowflake_df,
-    on=['schema','table'],
-    how='outer'
-)
-
-oldest_compare_df['match'] = (
-    oldest_compare_df['cloudera_oldest'] ==
-    oldest_compare_df['snowflake_oldest']
-)
-
-oldest_mismatch_df = oldest_compare_df[
-    oldest_compare_df['match'] == False
-]
-
-oldest_mismatch_df
-
-missing_oldest_df = oldest_compare_df[
-    oldest_compare_df['cloudera_oldest'].isna() |
-    oldest_compare_df['snowflake_oldest'].isna()
-]
-
-
-
-
-def normalize_type(dtype: str) -> str:
-    if dtype is None:
-        return None
-
-    dtype = dtype.lower()
-
-    # remove precision
-    base = dtype.split("(")[0]
-
-    mapping = {
-        "string": "string",
-        "varchar": "string",
-        "char": "string",
-        "text": "string",
-
-        "int": "number",
-        "bigint": "number",
-        "smallint": "number",
-        "tinyint": "number",
-        "number": "number",
-
-        "double": "float",
-        "float": "float",
-
-        "decimal": "decimal",
-        "numeric": "decimal",
-
-        "boolean": "boolean",
-        "date": "date",
-        "timestamp": "timestamp",
-        "timestamp_ntz": "timestamp",
-        "timestamp_ltz": "timestamp",
-    }
-
-    return mapping.get(base, base)
-
-
-cloudera_columns['normalized_type'] = cloudera_columns['data_type'].apply(normalize_type)
-sf_columns['normalized_type'] = sf_columns['data_type'].apply(normalize_type)
+Proposed Plan Forward
+“My proposed next steps are:
+Continue checksum validation using numeric columns for broad coverage.
+Work with business teams to identify critical columns for high-risk tables.
+Extend validation to include:
+Sum comparisons
+Record counts
+Oldest business day
+Produce a final reconciliation report summarizing:
+Structural differences
+Data completeness
+Datatype mismatches
+Data validation results”
 
 
-datatype_compare = cloudera_columns.merge(
-    sf_columns,
-    left_on=['schema','table','column'],
-    right_on=['schema','table','column_name'],
-    how='left',
-    suffixes=('_cloudera','_snowflake')
-)
+scripts/generate_oldest_counts_sql.sh
+#!/bin/bash
 
+INPUT="../input/oldest_business_day.csv"
+SQL_FILE="../logs/oldest_counts.sql"
 
-def classify_datatype(row):
-    if pd.isna(row['normalized_type_snowflake']):
-        return "MISSING_IN_SNOWFLAKE"
+mkdir -p ../logs
 
-    if row['normalized_type_cloudera'] == row['normalized_type_snowflake']:
-        return "MATCH"
+> $SQL_FILE
 
-    # Compatible cases
-    compatible_pairs = [
-        ("decimal", "number"),
-        ("number", "decimal"),
-    ]
+tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE OLDEST
+do
+    echo "SELECT '${SCHEMA}','${TABLE}','${OLDEST}', COUNT(*) 
+          FROM ${SCHEMA}.${TABLE}
+          WHERE business_day='${OLDEST}';" >> $SQL_FILE
+done
 
-    if (row['normalized_type_cloudera'], row['normalized_type_snowflake']) in compatible_pairs:
-        return "COMPATIBLE"
+echo "SQL generated → $SQL_FILE"
 
-    return "MISMATCH"
+scripts/run_oldest_counts.sh
+#!/bin/bash
 
-datatype_compare['datatype_status'] = datatype_compare.apply(classify_datatype, axis=1)
+SQL_FILE="../logs/oldest_counts.sql"
+RAW_OUT="../logs/oldest_counts_raw.txt"
+OUT="../output/oldest_day_counts.csv"
 
-datatype_mismatches = datatype_compare[
-    datatype_compare['datatype_status'] == "MISMATCH"
-]
+mkdir -p ../output ../logs
 
-datatype_mismatches
+echo "schema,table,oldest_business_day,record_count" > $OUT
 
-datatype_compatible = datatype_compare[
-    datatype_compare['datatype_status'] == "COMPATIBLE"
-]
+impala-shell -k -i your-host -f $SQL_FILE -B > $RAW_OUT
 
+# Parse output
+awk -F'\t' 'NF>=4 {print $1","$2","$3","$4}' $RAW_OUT >> $OUT
 
-import re
+echo "Oldest day counts → $OUT"
 
-def extract_precision(dtype):
-    match = re.search(r'\((\d+),?(\d+)?\)', str(dtype))
-    if match:
-        return match.group(1), match.group(2)
-    return None, None
-
-I worked on the Cloudera to Snowflake validation.
-On the Snowflake side, I validated schema presence and identified schemas that exist in Cloudera but are missing in Snowflake.
-I also validated tables from our scope and identified tables that are present in Cloudera but not in Snowflake.
-At the column level, I compared structures and found columns that are missing in Snowflake as well as extra columns present in Snowflake compared to Cloudera.
-Additionally, I counted records for one business day across all applicable tables in Snowflake to validate data completeness.
-Current work:
-I’m currently working on datatype validation. Since Snowflake uses types like NUMBER, DECIMAL, VARCHAR, etc., and Cloudera uses different representations, a direct comparison can give false mismatches.
-So I’m building a datatype mapping to normalize types and classify them as match, compatible, or true mismatch.
-Clarification / Question:
-I also noticed that Snowflake has extra columns compared to Cloudera.
-I wanted to confirm whether these additional columns — such as audit or metadata fields — should be considered acceptable, or if we need to flag them as discrepancies.
-Similarly, if there are extra tables in Snowflake that are not part of the migration scope, should we ignore them or include them in validation?
