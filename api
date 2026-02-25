@@ -1,105 +1,68 @@
-generate_oldest_day_count_sql.sh
-#!/bin/bash
-
-INPUT="../input/cloudera_oldest_business_day.csv"
-SQL_FILE="../logs/oldest_day_counts.sql"
-
-> $SQL_FILE
-
-tail -n +2 $INPUT | while IFS=',' read SCHEMA_TABLE OLDEST
-do
-    # Skip null or empty dates
-    if [[ -z "$OLDEST" || "$OLDEST" == "NULL" ]]; then
-        echo "Skipping $SCHEMA_TABLE due to NULL oldest date"
-        continue
-    fi
-
-    SCHEMA=$(echo $SCHEMA_TABLE | cut -d'.' -f1)
-    TABLE=$(echo $SCHEMA_TABLE | cut -d'.' -f2)
-
-    echo "SELECT '${SCHEMA}','${TABLE}','${OLDEST}', COUNT(*) 
-          FROM ${SCHEMA}.${TABLE}
-          WHERE business_day='${OLDEST}';" >> $SQL_FILE
-
-done
-
-echo "SQL generated → $SQL_FILE"
-
-
-run_oldest_day_counts.sh
-#!/bin/bash
-
-SQL_FILE="../logs/oldest_day_counts.sql"
-RAW_OUT="../logs/oldest_day_counts_raw.txt"
-OUT="../output/cloudera_oldest_day_counts.csv"
 import pandas as pd
 
-cloudera_oldest = pd.read_csv("cloudera_oldest_business_day.csv")
-cloudera_oldest[['schema','table']] = cloudera_oldest['schema_table'].str.split('.', expand=True)
+cloudera_counts = pd.read_csv("cloudera_oldest_counts.csv")
 
-echo "schema,table,business_day,record_count" > $OUT
+# normalize case
+cloudera_counts['schema'] = cloudera_counts['schema'].str.lower()
+cloudera_counts['table'] = cloudera_counts['table'].str.lower()
 
-impala-shell -k -i your-host -f $SQL_FILE -B > $RAW_OUT
+valid_rows = cloudera_counts.dropna(subset=['oldest_business_day'])
+valid_rows = valid_rows[valid_rows['oldest_business_day'] != ""]
 
-awk -F'\t' 'NF>=4 {print $1","$2","$3","$4}' $RAW_OUT >> $OUT
+tables_with_bd = sf_columns[
+    sf_columns['column_name'] == 'business_day'
+][['schema','table']].drop_duplicates()
 
-echo "Cloudera counts → $OUT"
+valid_rows = valid_rows.merge(
+    tables_with_bd,
+    on=['schema','table'],
+    how='inner'
+)
 
+snowflake_results = []
 
-
-import pandas as pd
-
-cloudera_oldest = pd.read_csv("cloudera_oldest_business_day.csv")
-cloudera_oldest[['schema','table']] = cloudera_oldest['schema_table'].str.split('.', expand=True)
-valid_oldest = cloudera_oldest.dropna(subset=['oldest_business_day'])
-
-snowflake_counts = []
-
-for _, row in valid_oldest.iterrows():
+for _, row in valid_rows.iterrows():
     schema = row['schema']
     table = row['table']
     oldest = row['oldest_business_day']
 
     try:
-        df = session.sql(
-            f"""
-            SELECT COUNT(*) AS record_count
-            FROM prod.{schema}.{table}
-            WHERE business_day = '{oldest}'
-            """
-        ).to_pandas()
+        query = f"""
+        SELECT COUNT(*) AS record_count
+        FROM prod.{schema}.{table}
+        WHERE business_day = '{oldest}'
+        """
 
-        snowflake_counts.append({
+        df = session.sql(query).to_pandas()
+
+        count_val = df.iloc[0,0] if not df.empty else 0
+
+        snowflake_results.append({
             "schema": schema,
             "table": table,
-            "business_day": oldest,
-            "record_count": df.iloc[0,0]
+            "oldest_business_day": oldest,
+            "record_count": count_val
         })
 
     except Exception as e:
         print(f"Skipped {schema}.{table}: {e}")
 
-snowflake_counts_df = pd.DataFrame(snowflake_counts)
+snowflake_counts_df = pd.DataFrame(snowflake_results)
 snowflake_counts_df
 
-cloudera_counts = pd.read_csv("cloudera_oldest_day_counts.csv")
-
-count_compare = cloudera_counts.merge(
+comparison = cloudera_counts.merge(
     snowflake_counts_df,
-    on=['schema','table','business_day'],
-    how='outer',
+    on=['schema','table','oldest_business_day'],
+    how='left',
     suffixes=('_cloudera','_snowflake')
 )
 
-count_compare['match'] = (
-    count_compare['record_count_cloudera'] ==
-    count_compare['record_count_snowflake']
+comparison['match'] = (
+    comparison['record_count_cloudera'] ==
+    comparison['record_count_snowflake']
 )
 
-count_compare
+comparison
 
-count_mismatches = count_compare[count_compare['match'] == False]
-count_mismatches
-
-
-
+mismatch_counts = comparison[comparison['match'] == False]
+mismatch_counts
