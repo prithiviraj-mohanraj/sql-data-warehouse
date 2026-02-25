@@ -1,107 +1,105 @@
-Opening — Context
-“Today I’ll walk you through the validation framework we built to reconcile Cloudera and Snowflake as part of the migration.
-The goal is to ensure that only the scoped schemas and tables provided by the vendor are correctly migrated, structurally consistent, and data complete.”
-🔹 2. Scope Control — Why We Filtered
-“One key challenge was that Snowflake contains around 180 schemas and Cloudera contains thousands of tables, but our migration scope includes only 24 schemas and 84 tables.
-So the first thing I implemented was scope-driven validation.
-All checks are restricted to schemas and tables listed in the input files, avoiding unnecessary scans and ensuring production safety.”
-🔹 3. What Has Been Completed
-✅ Schema Validation
-“We validated that all schemas present in Cloudera are also present in Snowflake and identified any missing schemas.”
-👉 Outcome:
-Clear list of schemas missing in Snowflake.
-✅ Table Validation
-“We compared tables from the migration scope and identified tables present in Cloudera but missing in Snowflake.”
-👉 Outcome:
-Clear list of missing tables for remediation.
-✅ Column Validation
-“We extracted column names and datatypes from both systems and performed structural comparisons.”
-We identified:
-Missing columns in Snowflake
-Extra columns in Snowflake
-Column count mismatches
-👉 This helped explain why some tables had higher column counts in Snowflake.
-✅ Datatype Validation (Normalized Comparison)
-“Since Cloudera and Snowflake use different datatype systems, we implemented datatype normalization.
-For example:
-string vs varchar → treated as match
-int vs number → treated as match
-decimal vs number → treated as compatible
-This avoids false mismatches and highlights only real issues.”
-👉 Outcome:
-Exact count of true datatype mismatches
-Compatible differences flagged separately
-✅ Data Completeness Validation
-“We validated data completeness using business_day.”
-Completed checks:
-Oldest business day per table
-Record counts for selected business days
-Identification of tables with missing historical data
-👉 Outcome:
-Detection of partial loads or missing history
-🔹 4. What I Am Working On Now
-“Currently, I am enhancing data validation using checksum-style comparisons.
-The idea is to compute aggregates such as counts and sums to ensure data consistency between Cloudera and Snowflake.”
-🔹 5. Checksum Strategy — Current Approach
-“My current approach is:
-Use business_day as the primary partition filter.
-For each table, select the first one or two numeric columns.
-Compute aggregate values like SUM for those columns.
-Store which columns were used for checksum in the output.
-This allows us to:
-Validate data accuracy without scanning entire tables
-Ensure the same columns are used for Snowflake validation
-Provide traceability by documenting checksum columns used”
-
-Proposed Plan Forward
-“My proposed next steps are:
-Continue checksum validation using numeric columns for broad coverage.
-Work with business teams to identify critical columns for high-risk tables.
-Extend validation to include:
-Sum comparisons
-Record counts
-Oldest business day
-Produce a final reconciliation report summarizing:
-Structural differences
-Data completeness
-Datatype mismatches
-Data validation results”
-
-
-scripts/generate_oldest_counts_sql.sh
+generate_oldest_day_count_sql.sh
 #!/bin/bash
 
-INPUT="../input/oldest_business_day.csv"
-SQL_FILE="../logs/oldest_counts.sql"
-
-mkdir -p ../logs
+INPUT="../input/cloudera_oldest_business_day.csv"
+SQL_FILE="../logs/oldest_day_counts.sql"
 
 > $SQL_FILE
 
-tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE OLDEST
+tail -n +2 $INPUT | while IFS=',' read SCHEMA_TABLE OLDEST
 do
+    # Skip null or empty dates
+    if [[ -z "$OLDEST" || "$OLDEST" == "NULL" ]]; then
+        echo "Skipping $SCHEMA_TABLE due to NULL oldest date"
+        continue
+    fi
+
+    SCHEMA=$(echo $SCHEMA_TABLE | cut -d'.' -f1)
+    TABLE=$(echo $SCHEMA_TABLE | cut -d'.' -f2)
+
     echo "SELECT '${SCHEMA}','${TABLE}','${OLDEST}', COUNT(*) 
           FROM ${SCHEMA}.${TABLE}
           WHERE business_day='${OLDEST}';" >> $SQL_FILE
+
 done
 
 echo "SQL generated → $SQL_FILE"
 
-scripts/run_oldest_counts.sh
+
+run_oldest_day_counts.sh
 #!/bin/bash
 
-SQL_FILE="../logs/oldest_counts.sql"
-RAW_OUT="../logs/oldest_counts_raw.txt"
-OUT="../output/oldest_day_counts.csv"
+SQL_FILE="../logs/oldest_day_counts.sql"
+RAW_OUT="../logs/oldest_day_counts_raw.txt"
+OUT="../output/cloudera_oldest_day_counts.csv"
+import pandas as pd
 
-mkdir -p ../output ../logs
+cloudera_oldest = pd.read_csv("cloudera_oldest_business_day.csv")
+cloudera_oldest[['schema','table']] = cloudera_oldest['schema_table'].str.split('.', expand=True)
 
-echo "schema,table,oldest_business_day,record_count" > $OUT
+echo "schema,table,business_day,record_count" > $OUT
 
 impala-shell -k -i your-host -f $SQL_FILE -B > $RAW_OUT
 
-# Parse output
 awk -F'\t' 'NF>=4 {print $1","$2","$3","$4}' $RAW_OUT >> $OUT
 
-echo "Oldest day counts → $OUT"
+echo "Cloudera counts → $OUT"
+
+
+
+import pandas as pd
+
+cloudera_oldest = pd.read_csv("cloudera_oldest_business_day.csv")
+cloudera_oldest[['schema','table']] = cloudera_oldest['schema_table'].str.split('.', expand=True)
+valid_oldest = cloudera_oldest.dropna(subset=['oldest_business_day'])
+
+snowflake_counts = []
+
+for _, row in valid_oldest.iterrows():
+    schema = row['schema']
+    table = row['table']
+    oldest = row['oldest_business_day']
+
+    try:
+        df = session.sql(
+            f"""
+            SELECT COUNT(*) AS record_count
+            FROM prod.{schema}.{table}
+            WHERE business_day = '{oldest}'
+            """
+        ).to_pandas()
+
+        snowflake_counts.append({
+            "schema": schema,
+            "table": table,
+            "business_day": oldest,
+            "record_count": df.iloc[0,0]
+        })
+
+    except Exception as e:
+        print(f"Skipped {schema}.{table}: {e}")
+
+snowflake_counts_df = pd.DataFrame(snowflake_counts)
+snowflake_counts_df
+
+cloudera_counts = pd.read_csv("cloudera_oldest_day_counts.csv")
+
+count_compare = cloudera_counts.merge(
+    snowflake_counts_df,
+    on=['schema','table','business_day'],
+    how='outer',
+    suffixes=('_cloudera','_snowflake')
+)
+
+count_compare['match'] = (
+    count_compare['record_count_cloudera'] ==
+    count_compare['record_count_snowflake']
+)
+
+count_compare
+
+count_mismatches = count_compare[count_compare['match'] == False]
+count_mismatches
+
+
 
