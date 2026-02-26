@@ -98,4 +98,13 @@ extra_tables_in_sf.rename(columns={'name':'table'}, inplace=True)
 
 extra_tables_in_sf
 
+#!/bin/bash
 
+OUT="../output/sl1_schemas.txt"
+
+echo "Extracting SL1 schemas..."
+
+impala-shell -k -i your-host -q "SHOW DATABASES LIKE 'sl1*';" -B \
+| awk 'NF>0 {print $1}' > $OUT
+
+echo "Saved → $OUT"
