@@ -1,68 +1,101 @@
+extract_sl1_schemas.sh
+#!/bin/bash
+
+OUT="../output/sl1_schemas.txt"
+
+echo "Extracting SL1 schemas..."
+
+impala-shell -k -i your-host -q "SHOW DATABASES LIKE 'sl1*';" -B > $OUT
+
+echo "Saved → $OUT"
+
+extract_sl1_tables.sh
+#!/bin/bash
+
+SCHEMA_FILE="../output/sl1_schemas.txt"
+OUT="../output/sl1_tables.csv"
+
+echo "schema,table" > $OUT
+
+while read SCHEMA
+do
+    echo "Processing $SCHEMA"
+
+    impala-shell -k -i your-host -q "SHOW TABLES IN $SCHEMA;" -B | \
+    awk -v s="$SCHEMA" '{print s","$1}' >> $OUT
+
+done < $SCHEMA_FILE
+
+echo "Saved → $OUT"
+
 import pandas as pd
 
-cloudera_counts = pd.read_csv("cloudera_oldest_counts.csv")
+sl1_schemas = pd.read_csv("sl1_schemas.txt", header=None, names=["schema"])
+sl1_tables = pd.read_csv("sl1_tables.csv")
 
-# normalize case
-cloudera_counts['schema'] = cloudera_counts['schema'].str.lower()
-cloudera_counts['table'] = cloudera_counts['table'].str.lower()
+# normalize
+sl1_schemas['schema'] = sl1_schemas['schema'].str.lower()
+sl1_tables = sl1_tables.apply(lambda col: col.str.lower() if col.dtype=="object" else col)
 
-valid_rows = cloudera_counts.dropna(subset=['oldest_business_day'])
-valid_rows = valid_rows[valid_rows['oldest_business_day'] != ""]
+sf_schemas = session.sql("SHOW SCHEMAS").to_pandas()
+sf_schemas['name'] = sf_schemas['name'].str.lower()
 
-tables_with_bd = sf_columns[
-    sf_columns['column_name'] == 'business_day'
-][['schema','table']].drop_duplicates()
-
-valid_rows = valid_rows.merge(
-    tables_with_bd,
-    on=['schema','table'],
-    how='inner'
-)
-
-snowflake_results = []
-
-for _, row in valid_rows.iterrows():
-    schema = row['schema']
-    table = row['table']
-    oldest = row['oldest_business_day']
-
-    try:
-        query = f"""
-        SELECT COUNT(*) AS record_count
-        FROM prod.{schema}.{table}
-        WHERE business_day = '{oldest}'
-        """
-
-        df = session.sql(query).to_pandas()
-
-        count_val = df.iloc[0,0] if not df.empty else 0
-
-        snowflake_results.append({
-            "schema": schema,
-            "table": table,
-            "oldest_business_day": oldest,
-            "record_count": count_val
-        })
-
-    except Exception as e:
-        print(f"Skipped {schema}.{table}: {e}")
-
-snowflake_counts_df = pd.DataFrame(snowflake_results)
-snowflake_counts_df
-
-comparison = cloudera_counts.merge(
-    snowflake_counts_df,
-    on=['schema','table','oldest_business_day'],
+schema_check = sl1_schemas.merge(
+    sf_schemas[['name']],
+    left_on='schema',
+    right_on='name',
     how='left',
-    suffixes=('_cloudera','_snowflake')
+    indicator=True
 )
 
-comparison['match'] = (
-    comparison['record_count_cloudera'] ==
-    comparison['record_count_snowflake']
+schema_check['exists_in_snowflake'] = schema_check['_merge'] == 'both'
+schema_check = schema_check[['schema','exists_in_snowflake']]
+
+schema_check
+
+sf_tables_list = []
+
+for schema in sl1_schemas['schema']:
+    try:
+        df = session.sql(f"SHOW TABLES IN SCHEMA prod.{schema}").to_pandas()
+        df['schema'] = schema
+        sf_tables_list.append(df[['schema','name']])
+    except:
+        pass
+
+sf_tables = pd.concat(sf_tables_list, ignore_index=True)
+sf_tables['name'] = sf_tables['name'].str.lower()
+
+
+
+tables_missing_in_sf = sl1_tables.merge(
+    sf_tables,
+    left_on=['schema','table'],
+    right_on=['schema','name'],
+    how='left',
+    indicator=True
 )
 
-comparison
+tables_missing_in_sf = tables_missing_in_sf[
+    tables_missing_in_sf['_merge'] == 'left_only'
+][['schema','table']]
 
-mismatch_counts = comparison[comparison['match'] == False]
-mismatch_counts
+tables_missing_in_sf
+
+extra_tables_in_sf = sf_tables.merge(
+    sl1_tables,
+    left_on=['schema','name'],
+    right_on=['schema','table'],
+    how='left',
+    indicator=True
+)
+
+extra_tables_in_sf = extra_tables_in_sf[
+    extra_tables_in_sf['_merge'] == 'left_only'
+][['schema','name']]
+
+extra_tables_in_sf.rename(columns={'name':'table'}, inplace=True)
+
+extra_tables_in_sf
+
+
