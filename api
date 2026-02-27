@@ -95,3 +95,202 @@ with open(OUT_FILE, "w", newline="") as out:
                         ])
 
 print("Extraction complete → sl1_table_columns.psv")
+
+
+
+
+
+******** snowflake side******
+
+import pandas as pd
+
+schemas = pd.read_csv("sl1_schemas.txt", header=None, names=["schema"])
+cloudera_tables = pd.read_csv("sl1_tables.csv")
+cloudera_columns = pd.read_csv("sl1_table_columns.psv", sep="|")
+
+# normalize
+for df in [schemas, cloudera_tables, cloudera_columns]:
+    for col in df.columns:
+        if df[col].dtype == "object":
+            df[col] = df[col].str.lower()
+
+sf_schemas = session.sql("SHOW SCHEMAS").to_pandas()
+sf_schemas['name'] = sf_schemas['name'].str.lower()
+
+schema_validation = schemas.merge(
+    sf_schemas[['name']],
+    left_on='schema',
+    right_on='name',
+    how='left',
+    indicator=True
+)
+
+schema_validation['exists_in_snowflake'] = schema_validation['_merge'] == 'both'
+schema_validation = schema_validation[['schema','exists_in_snowflake']]
+
+schema_validation
+
+sf_tables_list = []
+
+for schema in schemas['schema']:
+    try:
+        df = session.sql(f"SHOW TABLES IN SCHEMA prod.{schema}").to_pandas()
+        df['schema'] = schema
+        sf_tables_list.append(df[['schema','name']])
+    except:
+        pass
+
+sf_tables = pd.concat(sf_tables_list, ignore_index=True)
+sf_tables.rename(columns={"name":"table"}, inplace=True)
+sf_tables['table'] = sf_tables['table'].str.lower()
+
+missing_tables = cloudera_tables.merge(
+    sf_tables,
+    on=['schema','table'],
+    how='left',
+    indicator=True
+)
+
+missing_tables = missing_tables[
+    missing_tables['_merge'] == 'left_only'
+][['schema','table']]
+
+
+
+extra_tables = sf_tables.merge(
+    cloudera_tables,
+    on=['schema','table'],
+    how='left',
+    indicator=True
+)
+
+extra_tables = extra_tables[
+    extra_tables['_merge'] == 'left_only'
+][['schema','table']]
+
+cloudera_counts = cloudera_tables.groupby('schema').size().reset_index(name='cloudera_tables')
+snowflake_counts = sf_tables.groupby('schema').size().reset_index(name='snowflake_tables')
+
+table_summary = cloudera_counts.merge(snowflake_counts, on='schema', how='left')
+table_summary.fillna(0, inplace=True)
+
+table_summary
+
+
+
+sf_columns_list = []
+
+for _, row in cloudera_tables.iterrows():
+    schema = row['schema']
+    table = row['table']
+
+    try:
+        df = session.sql(f"SHOW COLUMNS IN TABLE prod.{schema}.{table}").to_pandas()
+        df['schema'] = schema
+        df['table'] = table
+        sf_columns_list.append(df[['schema','table','column_name','data_type']])
+    except:
+        pass
+
+sf_columns = pd.concat(sf_columns_list, ignore_index=True)
+sf_columns.rename(columns={"column_name":"column"}, inplace=True)
+sf_columns = sf_columns.apply(lambda col: col.str.lower() if col.dtype=="object" else col)
+
+
+
+missing_columns = cloudera_columns.merge(
+    sf_columns,
+    on=['schema','table','column'],
+    how='left',
+    indicator=True
+)
+
+missing_columns = missing_columns[
+    missing_columns['_merge'] == 'left_only'
+][['schema','table','column']]
+
+
+
+extra_columns = sf_columns.merge(
+    cloudera_columns,
+    on=['schema','table','column'],
+    how='left',
+    indicator=True
+)
+
+extra_columns = extra_columns[
+    extra_columns['_merge'] == 'left_only'
+][['schema','table','column']]
+
+
+cloudera_col_counts = cloudera_columns.groupby(['schema','table']).size().reset_index(name='cloudera_column_count')
+sf_col_counts = sf_columns.groupby(['schema','table']).size().reset_index(name='snowflake_column_count')
+
+column_count_compare = cloudera_col_counts.merge(
+    sf_col_counts,
+    on=['schema','table'],
+    how='left'
+)
+
+column_count_compare['match'] = (
+    column_count_compare['cloudera_column_count'] ==
+    column_count_compare['snowflake_column_count']
+)
+
+column_count_compare.fillna(0, inplace=True)
+
+
+cloudera_h = cloudera_tables[cloudera_tables['table'].str.endswith('_h')]
+snowflake_h = sf_tables[sf_tables['table'].str.endswith('_h')]
+
+missing_h_tables = cloudera_h.merge(
+    snowflake_h,
+    on=['schema','table'],
+    how='left',
+    indicator=True
+)
+
+missing_h_tables = missing_h_tables[
+    missing_h_tables['_merge'] == 'left_only'
+][['schema','table']]
+
+
+
+extra_h_tables = snowflake_h.merge(
+    cloudera_h,
+    on=['schema','table'],
+    how='left',
+    indicator=True
+)
+
+extra_h_tables = extra_h_tables[
+    extra_h_tables['_merge'] == 'left_only'
+][['schema','table']]
+
+
+
+cloudera_h_counts = cloudera_h.groupby('schema').size().reset_index(name='cloudera_h_tables')
+snowflake_h_counts = snowflake_h.groupby('schema').size().reset_index(name='snowflake_h_tables')
+missing_h_counts = missing_h_tables.groupby('schema').size().reset_index(name='missing_h_tables')
+
+h_summary = cloudera_h_counts \
+    .merge(snowflake_h_counts, on='schema', how='left') \
+    .merge(missing_h_counts, on='schema', how='left')
+
+h_summary.fillna(0, inplace=True)
+
+cloudera_h_cols = cloudera_columns[cloudera_columns['table'].str.endswith('_h')]
+sf_h_cols = sf_columns[sf_columns['table'].str.endswith('_h')]
+
+missing_h_columns = cloudera_h_cols.merge(
+    sf_h_cols,
+    on=['schema','table','column'],
+    how='left',
+    indicator=True
+)
+
+missing_h_columns = missing_h_columns[
+    missing_h_columns['_merge'] == 'left_only'
+][['schema','table','column']]
+
+
