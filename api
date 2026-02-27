@@ -1,91 +1,97 @@
-sf_tables = sf_tables.rename(columns={"name": "table"})
+scripts/generate_describe_batches.sh
+#!/bin/bash
 
-cloudera_h = sl1_tables[sl1_tables['table'].str.endswith('_h')]
-snowflake_h = sf_tables[sf_tables['table'].str.endswith('_h')]
+INPUT="../input/sl1_tables.csv"
+BATCH_SIZE=100
+OUT_DIR="../logs/describe_batches"
 
-cloudera_total_counts = (
-    sl1_tables.groupby('schema')
-    .size()
-    .reset_index(name='cloudera_total_tables')
-)
+mkdir -p $OUT_DIR
 
-cloudera_h_counts = (
-    cloudera_h.groupby('schema')
-    .size()
-    .reset_index(name='cloudera_h_tables')
-)
+tail -n +2 $INPUT > ../logs/tables_list.txt
 
-snowflake_total_counts = (
-    sf_tables.groupby('schema')
-    .size()
-    .reset_index(name='snowflake_total_tables')
-)
+split -l $BATCH_SIZE ../logs/tables_list.txt $OUT_DIR/batch_
 
-snowflake_h_counts = (
-    snowflake_h.groupby('schema')
-    .size()
-    .reset_index(name='snowflake_h_tables')
-)
+for file in $OUT_DIR/batch_*
+do
+    SQL_FILE="${file}.sql"
+    > $SQL_FILE
 
-missing_h_tables = cloudera_h.merge(
-    snowflake_h,
-    on=['schema','table'],
-    how='left',
-    indicator=True
-)
+    while IFS=',' read SCHEMA TABLE
+    do
+        echo "SELECT 'START:${SCHEMA}.${TABLE}';" >> $SQL_FILE
+        echo "DESCRIBE ${SCHEMA}.${TABLE};" >> $SQL_FILE
+        echo "SELECT 'END:${SCHEMA}.${TABLE}';" >> $SQL_FILE
+    done < $file
+done
 
-missing_h_tables = missing_h_tables[
-    missing_h_tables['_merge'] == 'left_only'
-][['schema','table']]
-
-missing_h_tables
-
-missing_h_counts = (
-    missing_h_tables.groupby('schema')
-    .size()
-    .reset_index(name='missing_h_tables')
-)
+echo "Batch SQL files created in $OUT_DIR"
 
 
-schema_summary = cloudera_total_counts \
-    .merge(cloudera_h_counts, on='schema', how='left') \
-    .merge(snowflake_total_counts, on='schema', how='left') \
-    .merge(snowflake_h_counts, on='schema', how='left') \
-    .merge(missing_h_counts, on='schema', how='left')
+scripts/run_describe_batches.sh
 
-schema_summary.fillna(0, inplace=True)
 
-schema_summary
 
-extra_h_tables = snowflake_h.merge(
-    cloudera_h,
-    on=['schema','table'],
-    how='left',
-    indicator=True
-)
+#!/bin/bash
 
-extra_h_tables = extra_h_tables[
-    extra_h_tables['_merge'] == 'left_only'
-][['schema','table']]
+BATCH_DIR="../logs/describe_batches"
+RAW_OUT_DIR="../logs/raw_describe"
 
-extra_h_tables
+mkdir -p $RAW_OUT_DIR
 
-missing_h_summary = (
-    missing_h_tables.groupby('schema')
-    .size()
-    .reset_index(name='missing_h_tables')
-)
+for SQL_FILE in $BATCH_DIR/*.sql
+do
+    BASENAME=$(basename $SQL_FILE .sql)
+    OUT_FILE="$RAW_OUT_DIR/${BASENAME}.txt"
 
-missing_h_summary
+    echo "Running batch $BASENAME"
 
-schemas_with_missing = missing_h_summary[
-    missing_h_summary['missing_h_tables'] > 0
-]
+    impala-shell -k -i your-host -f $SQL_FILE -B > $OUT_FILE
 
-schemas_with_missing
+    sleep 2   # prevent coordinator overload
+done
 
-total_missing = len(missing_h_tables)
-schemas_impacted = missing_h_tables['schema'].nunique()
+echo "All batches completed."
 
-print("Total missing _h tables:", total_missing)
-print("Schemas impacted:", schemas_impacted)
+
+scripts/parse_describe_output.py
+
+
+import os
+import csv
+
+RAW_DIR = "../logs/raw_describe"
+OUT_FILE = "../output/sl1_table_columns.psv"
+
+with open(OUT_FILE, "w", newline="") as out:
+    writer = csv.writer(out, delimiter="|")
+    writer.writerow(["schema","table","column","data_type"])
+
+    current_schema = None
+    current_table = None
+
+    for file in os.listdir(RAW_DIR):
+        with open(os.path.join(RAW_DIR, file)) as f:
+            for line in f:
+                line = line.strip()
+
+                if line.startswith("START:"):
+                    schema_table = line.split(":")[1]
+                    current_schema, current_table = schema_table.split(".")
+                    continue
+
+                if line.startswith("END:"):
+                    current_schema = None
+                    current_table = None
+                    continue
+
+                if current_schema and line and not line.startswith("#"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        writer.writerow([
+                            current_schema,
+                            current_table,
+                            parts[0],
+                            parts[1]
+                        ])
+
+print("Extraction complete → sl1_table_columns.psv")
