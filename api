@@ -1,82 +1,52 @@
-sf_columns_list = []
-
-for _, row in cloudera_tables.iterrows():
-    schema = row['schema']
-    table = row['table']
-
-    try:
-        df = session.sql(f"SHOW COLUMNS IN TABLE prod.{schema}.{table}").to_pandas()
-
-        df['schema'] = schema
-        df['table'] = table
-
-        # IMPORTANT: use 'type' column for datatype
-        sf_columns_list.append(df[['schema','table','column_name','type']])
-
-    except Exception as e:
-        print(f"Skipped {schema}.{table}: {e}")
-
-sf_columns = pd.concat(sf_columns_list, ignore_index=True)
-
-# rename columns
-sf_columns.rename(columns={
-    "column_name": "column",
-    "type": "data_type"
-}, inplace=True)
-
-# normalize case
-sf_columns = sf_columns.apply(lambda col: col.str.lower() if col.dtype=="object" else col)
-
-sf_columns.head()
-
-def normalize_type(dtype: str) -> str:
-    if dtype is None:
+def normalize_type(dtype):
+    if pd.isna(dtype):
         return None
 
     dtype = dtype.lower()
 
-    # remove precision
+    # remove precision (decimal(10,2) → decimal)
     base = dtype.split("(")[0]
 
     mapping = {
-        # strings
+        # STRING
         "string": "string",
         "varchar": "string",
         "char": "string",
         "text": "string",
 
-        # numbers
+        # NUMERIC
         "int": "number",
         "bigint": "number",
         "smallint": "number",
         "tinyint": "number",
-        "number": "number",
+        "decimal": "number",
+        "numeric": "number",
+        "fixed": "number",
 
-        # decimals
-        "decimal": "decimal",
-        "numeric": "decimal",
-
-        # floats
+        # FLOAT
         "double": "float",
         "float": "float",
 
-        # dates
+        # DATE/TIME
         "date": "date",
         "timestamp": "timestamp",
         "timestamp_ntz": "timestamp",
         "timestamp_ltz": "timestamp",
+        "timestamp_tz": "timestamp",
 
-        # boolean
+        # BOOLEAN
         "boolean": "boolean",
+        "bool": "boolean",
+
+        # COMPLEX
+        "array": "array",
+        "variant": "variant",
     }
 
     return mapping.get(base, base)
 
-
-
 cloudera_columns['normalized_type'] = cloudera_columns['data_type'].apply(normalize_type)
 sf_columns['normalized_type'] = sf_columns['data_type'].apply(normalize_type)
-
 
 
 datatype_compare = cloudera_columns.merge(
@@ -86,21 +56,13 @@ datatype_compare = cloudera_columns.merge(
     suffixes=('_cloudera','_snowflake')
 )
 
+
 def classify_datatype(row):
     if pd.isna(row['normalized_type_snowflake']):
         return "MISSING_IN_SNOWFLAKE"
 
     if row['normalized_type_cloudera'] == row['normalized_type_snowflake']:
         return "MATCH"
-
-    # compatible cases
-    compatible_pairs = [
-        ("decimal", "number"),
-        ("number", "decimal"),
-    ]
-
-    if (row['normalized_type_cloudera'], row['normalized_type_snowflake']) in compatible_pairs:
-        return "COMPATIBLE"
 
     return "MISMATCH"
 
