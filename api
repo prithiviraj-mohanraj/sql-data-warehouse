@@ -1,296 +1,41 @@
-scripts/generate_describe_batches.sh
-#!/bin/bash
-
-INPUT="../input/sl1_tables.csv"
-BATCH_SIZE=100
-OUT_DIR="../logs/describe_batches"
-
-mkdir -p $OUT_DIR
-
-tail -n +2 $INPUT > ../logs/tables_list.txt
-
-split -l $BATCH_SIZE ../logs/tables_list.txt $OUT_DIR/batch_
-
-for file in $OUT_DIR/batch_*
-do
-    SQL_FILE="${file}.sql"
-    > $SQL_FILE
-
-    while IFS=',' read SCHEMA TABLE
-    do
-        echo "SELECT 'START:${SCHEMA}.${TABLE}';" >> $SQL_FILE
-        echo "DESCRIBE ${SCHEMA}.${TABLE};" >> $SQL_FILE
-        echo "SELECT 'END:${SCHEMA}.${TABLE}';" >> $SQL_FILE
-    done < $file
-done
-
-echo "Batch SQL files created in $OUT_DIR"
-
-
-scripts/run_describe_batches.sh
-
-
-
-#!/bin/bash
-
-BATCH_DIR="../logs/describe_batches"
-RAW_OUT_DIR="../logs/raw_describe"
-
-mkdir -p $RAW_OUT_DIR
-
-for SQL_FILE in $BATCH_DIR/*.sql
-do
-    BASENAME=$(basename $SQL_FILE .sql)
-    OUT_FILE="$RAW_OUT_DIR/${BASENAME}.txt"
-
-    echo "Running batch $BASENAME"
-
-    impala-shell -k -i your-host -f $SQL_FILE -B > $OUT_FILE
-
-    sleep 2   # prevent coordinator overload
-done
-
-echo "All batches completed."
-
-
-scripts/parse_describe_output.py
-
-
-import os
-import csv
-
-RAW_DIR = "../logs/raw_describe"
-OUT_FILE = "../output/sl1_table_columns.psv"
-
-with open(OUT_FILE, "w", newline="") as out:
-    writer = csv.writer(out, delimiter="|")
-    writer.writerow(["schema","table","column","data_type"])
-
-    current_schema = None
-    current_table = None
-
-    for file in os.listdir(RAW_DIR):
-        with open(os.path.join(RAW_DIR, file)) as f:
-            for line in f:
-                line = line.strip()
-
-                if line.startswith("START:"):
-                    schema_table = line.split(":")[1]
-                    current_schema, current_table = schema_table.split(".")
-                    continue
-
-                if line.startswith("END:"):
-                    current_schema = None
-                    current_table = None
-                    continue
-
-                if current_schema and line and not line.startswith("#"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        writer.writerow([
-                            current_schema,
-                            current_table,
-                            parts[0],
-                            parts[1]
-                        ])
-
-print("Extraction complete → sl1_table_columns.psv")
-
-
-
-
-
-******** snowflake side******
-
-import pandas as pd
-
-schemas = pd.read_csv("sl1_schemas.txt", header=None, names=["schema"])
-cloudera_tables = pd.read_csv("sl1_tables.csv")
-cloudera_columns = pd.read_csv("sl1_table_columns.psv", sep="|")
-
-# normalize
-for df in [schemas, cloudera_tables, cloudera_columns]:
-    for col in df.columns:
-        if df[col].dtype == "object":
-            df[col] = df[col].str.lower()
-
-sf_schemas = session.sql("SHOW SCHEMAS").to_pandas()
-sf_schemas['name'] = sf_schemas['name'].str.lower()
-
-schema_validation = schemas.merge(
-    sf_schemas[['name']],
-    left_on='schema',
-    right_on='name',
-    how='left',
-    indicator=True
-)
-
-schema_validation['exists_in_snowflake'] = schema_validation['_merge'] == 'both'
-schema_validation = schema_validation[['schema','exists_in_snowflake']]
-
-schema_validation
-
-sf_tables_list = []
-
-for schema in schemas['schema']:
-    try:
-        df = session.sql(f"SHOW TABLES IN SCHEMA prod.{schema}").to_pandas()
-        df['schema'] = schema
-        sf_tables_list.append(df[['schema','name']])
-    except:
-        pass
-
-sf_tables = pd.concat(sf_tables_list, ignore_index=True)
-sf_tables.rename(columns={"name":"table"}, inplace=True)
-sf_tables['table'] = sf_tables['table'].str.lower()
-
-missing_tables = cloudera_tables.merge(
+valid_tables = cloudera_tables.merge(
     sf_tables,
     on=['schema','table'],
-    how='left',
-    indicator=True
+    how='inner'
 )
-
-missing_tables = missing_tables[
-    missing_tables['_merge'] == 'left_only'
-][['schema','table']]
-
-
-
-extra_tables = sf_tables.merge(
-    cloudera_tables,
-    on=['schema','table'],
-    how='left',
-    indicator=True
-)
-
-extra_tables = extra_tables[
-    extra_tables['_merge'] == 'left_only'
-][['schema','table']]
-
-cloudera_counts = cloudera_tables.groupby('schema').size().reset_index(name='cloudera_tables')
-snowflake_counts = sf_tables.groupby('schema').size().reset_index(name='snowflake_tables')
-
-table_summary = cloudera_counts.merge(snowflake_counts, on='schema', how='left')
-table_summary.fillna(0, inplace=True)
-
-table_summary
-
-
 
 sf_columns_list = []
 
-for _, row in cloudera_tables.iterrows():
+total = len(valid_tables)
+print(f"Extracting columns for {total} tables...")
+
+for i, row in valid_tables.iterrows():
     schema = row['schema']
     table = row['table']
 
     try:
         df = session.sql(f"SHOW COLUMNS IN TABLE prod.{schema}.{table}").to_pandas()
+
+        # extract correct fields
         df['schema'] = schema
         df['table'] = table
-        sf_columns_list.append(df[['schema','table','column_name','data_type']])
-    except:
-        pass
 
+        sf_columns_list.append(
+            df[['schema','table','column_name','data_type']]
+        )
+
+    except Exception as e:
+        print(f"Skipped {schema}.{table}: {e}")
+
+    # progress indicator every 50 tables
+    if (i+1) % 50 == 0:
+        print(f"Processed {i+1}/{total} tables")
+
+# combine results
 sf_columns = pd.concat(sf_columns_list, ignore_index=True)
-sf_columns.rename(columns={"column_name":"column"}, inplace=True)
+
+# normalize
+sf_columns.rename(columns={'column_name':'column'}, inplace=True)
 sf_columns = sf_columns.apply(lambda col: col.str.lower() if col.dtype=="object" else col)
 
-
-
-missing_columns = cloudera_columns.merge(
-    sf_columns,
-    on=['schema','table','column'],
-    how='left',
-    indicator=True
-)
-
-missing_columns = missing_columns[
-    missing_columns['_merge'] == 'left_only'
-][['schema','table','column']]
-
-
-
-extra_columns = sf_columns.merge(
-    cloudera_columns,
-    on=['schema','table','column'],
-    how='left',
-    indicator=True
-)
-
-extra_columns = extra_columns[
-    extra_columns['_merge'] == 'left_only'
-][['schema','table','column']]
-
-
-cloudera_col_counts = cloudera_columns.groupby(['schema','table']).size().reset_index(name='cloudera_column_count')
-sf_col_counts = sf_columns.groupby(['schema','table']).size().reset_index(name='snowflake_column_count')
-
-column_count_compare = cloudera_col_counts.merge(
-    sf_col_counts,
-    on=['schema','table'],
-    how='left'
-)
-
-column_count_compare['match'] = (
-    column_count_compare['cloudera_column_count'] ==
-    column_count_compare['snowflake_column_count']
-)
-
-column_count_compare.fillna(0, inplace=True)
-
-
-cloudera_h = cloudera_tables[cloudera_tables['table'].str.endswith('_h')]
-snowflake_h = sf_tables[sf_tables['table'].str.endswith('_h')]
-
-missing_h_tables = cloudera_h.merge(
-    snowflake_h,
-    on=['schema','table'],
-    how='left',
-    indicator=True
-)
-
-missing_h_tables = missing_h_tables[
-    missing_h_tables['_merge'] == 'left_only'
-][['schema','table']]
-
-
-
-extra_h_tables = snowflake_h.merge(
-    cloudera_h,
-    on=['schema','table'],
-    how='left',
-    indicator=True
-)
-
-extra_h_tables = extra_h_tables[
-    extra_h_tables['_merge'] == 'left_only'
-][['schema','table']]
-
-
-
-cloudera_h_counts = cloudera_h.groupby('schema').size().reset_index(name='cloudera_h_tables')
-snowflake_h_counts = snowflake_h.groupby('schema').size().reset_index(name='snowflake_h_tables')
-missing_h_counts = missing_h_tables.groupby('schema').size().reset_index(name='missing_h_tables')
-
-h_summary = cloudera_h_counts \
-    .merge(snowflake_h_counts, on='schema', how='left') \
-    .merge(missing_h_counts, on='schema', how='left')
-
-h_summary.fillna(0, inplace=True)
-
-cloudera_h_cols = cloudera_columns[cloudera_columns['table'].str.endswith('_h')]
-sf_h_cols = sf_columns[sf_columns['table'].str.endswith('_h')]
-
-missing_h_columns = cloudera_h_cols.merge(
-    sf_h_cols,
-    on=['schema','table','column'],
-    how='left',
-    indicator=True
-)
-
-missing_h_columns = missing_h_columns[
-    missing_h_columns['_merge'] == 'left_only'
-][['schema','table','column']]
-
-
+sf_columns.head()
