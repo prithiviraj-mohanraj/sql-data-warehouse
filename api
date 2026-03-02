@@ -1,11 +1,25 @@
+
+schema_list = "','".join(schemas['schema'])
+sf_columns = session.sql(f"""
+SELECT
+    lower(table_schema) AS schema,
+    lower(table_name) AS table,
+    lower(column_name) AS column,
+    lower(data_type) AS data_type
+FROM prod.information_schema.columns
+WHERE lower(table_schema) IN ('{schema_list}')
+""").to_pandas()
+
+import re
+
 def normalize_type(dtype):
     if pd.isna(dtype):
         return None
 
     dtype = dtype.lower()
 
-    # remove precision (decimal(10,2) → decimal)
-    base = dtype.split("(")[0]
+    # remove precision: number(38,0) → number
+    base = re.split(r'\(|\s', dtype)[0]
 
     mapping = {
         # STRING
@@ -21,7 +35,7 @@ def normalize_type(dtype):
         "tinyint": "number",
         "decimal": "number",
         "numeric": "number",
-        "fixed": "number",
+        "number": "number",
 
         # FLOAT
         "double": "float",
@@ -45,9 +59,12 @@ def normalize_type(dtype):
 
     return mapping.get(base, base)
 
+
 cloudera_columns['normalized_type'] = cloudera_columns['data_type'].apply(normalize_type)
 sf_columns['normalized_type'] = sf_columns['data_type'].apply(normalize_type)
 
+cloudera_columns['normalized_type'] = cloudera_columns['data_type'].apply(normalize_type)
+sf_columns['normalized_type'] = sf_columns['data_type'].apply(normalize_type)
 
 datatype_compare = cloudera_columns.merge(
     sf_columns,
@@ -55,7 +72,6 @@ datatype_compare = cloudera_columns.merge(
     how='left',
     suffixes=('_cloudera','_snowflake')
 )
-
 
 def classify_datatype(row):
     if pd.isna(row['normalized_type_snowflake']):
@@ -67,3 +83,5 @@ def classify_datatype(row):
     return "MISMATCH"
 
 datatype_compare['datatype_status'] = datatype_compare.apply(classify_datatype, axis=1)
+
+
