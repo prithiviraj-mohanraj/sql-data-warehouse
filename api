@@ -1,82 +1,107 @@
-valid_tables = cloudera_tables.merge(
-    sf_tables,
-    on=['schema','table'],
-    how='inner'
-)
-
 sf_columns_list = []
 
-total = len(valid_tables)
-print(f"Extracting columns for {total} tables...")
-
-for i, row in valid_tables.iterrows():
+for _, row in cloudera_tables.iterrows():
     schema = row['schema']
     table = row['table']
 
     try:
         df = session.sql(f"SHOW COLUMNS IN TABLE prod.{schema}.{table}").to_pandas()
 
-        # extract correct fields
         df['schema'] = schema
         df['table'] = table
 
-        sf_columns_list.append(
-            df[['schema','table','column_name','data_type']]
-        )
+        # IMPORTANT: use 'type' column for datatype
+        sf_columns_list.append(df[['schema','table','column_name','type']])
 
     except Exception as e:
         print(f"Skipped {schema}.{table}: {e}")
 
-    # progress indicator every 50 tables
-    if (i+1) % 50 == 0:
-        print(f"Processed {i+1}/{total} tables")
-
-# combine results
 sf_columns = pd.concat(sf_columns_list, ignore_index=True)
 
-# normalize
-sf_columns.rename(columns={'column_name':'column'}, inplace=True)
+# rename columns
+sf_columns.rename(columns={
+    "column_name": "column",
+    "type": "data_type"
+}, inplace=True)
+
+# normalize case
 sf_columns = sf_columns.apply(lambda col: col.str.lower() if col.dtype=="object" else col)
 
 sf_columns.head()
 
+def normalize_type(dtype: str) -> str:
+    if dtype is None:
+        return None
 
-tables_with_bd = sf_columns[sf_columns['column'] == 'business_day'][['schema','table']].drop_duplicates()
+    dtype = dtype.lower()
 
-import time
+    # remove precision
+    base = dtype.split("(")[0]
 
-oldest_results = []
-total = len(tables_with_bd)
+    mapping = {
+        # strings
+        "string": "string",
+        "varchar": "string",
+        "char": "string",
+        "text": "string",
 
-print(f"Computing oldest business_day for {total} tables...")
+        # numbers
+        "int": "number",
+        "bigint": "number",
+        "smallint": "number",
+        "tinyint": "number",
+        "number": "number",
 
-for i, row in tables_with_bd.iterrows():
-    schema = row['schema']
-    table = row['table']
+        # decimals
+        "decimal": "decimal",
+        "numeric": "decimal",
 
-    start_time = time.time()
+        # floats
+        "double": "float",
+        "float": "float",
 
-    try:
-        print(f"[{i+1}/{total}] Processing {schema}.{table} ...")
+        # dates
+        "date": "date",
+        "timestamp": "timestamp",
+        "timestamp_ntz": "timestamp",
+        "timestamp_ltz": "timestamp",
 
-        df = session.sql(
-            f"SELECT MIN(business_day) AS oldest_business_day FROM prod.{schema}.{table}"
-        ).to_pandas()
+        # boolean
+        "boolean": "boolean",
+    }
 
-        oldest = df.iloc[0,0] if not df.empty else None
+    return mapping.get(base, base)
 
-        duration = round(time.time() - start_time, 2)
 
-        print(f"   → Done in {duration}s | oldest = {oldest}")
 
-        oldest_results.append({
-            "schema": schema,
-            "table": table,
-            "oldest_business_day": oldest,
-            "runtime_sec": duration
-        })
+cloudera_columns['normalized_type'] = cloudera_columns['data_type'].apply(normalize_type)
+sf_columns['normalized_type'] = sf_columns['data_type'].apply(normalize_type)
 
-    except Exception as e:
-        print(f"   → Skipped {schema}.{table}: {e}")
 
-oldest_business_day_df = pd.DataFrame(oldest_results)
+
+datatype_compare = cloudera_columns.merge(
+    sf_columns,
+    on=['schema','table','column'],
+    how='left',
+    suffixes=('_cloudera','_snowflake')
+)
+
+def classify_datatype(row):
+    if pd.isna(row['normalized_type_snowflake']):
+        return "MISSING_IN_SNOWFLAKE"
+
+    if row['normalized_type_cloudera'] == row['normalized_type_snowflake']:
+        return "MATCH"
+
+    # compatible cases
+    compatible_pairs = [
+        ("decimal", "number"),
+        ("number", "decimal"),
+    ]
+
+    if (row['normalized_type_cloudera'], row['normalized_type_snowflake']) in compatible_pairs:
+        return "COMPATIBLE"
+
+    return "MISMATCH"
+
+datatype_compare['datatype_status'] = datatype_compare.apply(classify_datatype, axis=1)
