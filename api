@@ -39,3 +39,44 @@ sf_columns.rename(columns={'column_name':'column'}, inplace=True)
 sf_columns = sf_columns.apply(lambda col: col.str.lower() if col.dtype=="object" else col)
 
 sf_columns.head()
+
+
+tables_with_bd = sf_columns[sf_columns['column'] == 'business_day'][['schema','table']].drop_duplicates()
+
+import time
+
+oldest_results = []
+total = len(tables_with_bd)
+
+print(f"Computing oldest business_day for {total} tables...")
+
+for i, row in tables_with_bd.iterrows():
+    schema = row['schema']
+    table = row['table']
+
+    start_time = time.time()
+
+    try:
+        print(f"[{i+1}/{total}] Processing {schema}.{table} ...")
+
+        df = session.sql(
+            f"SELECT MIN(business_day) AS oldest_business_day FROM prod.{schema}.{table}"
+        ).to_pandas()
+
+        oldest = df.iloc[0,0] if not df.empty else None
+
+        duration = round(time.time() - start_time, 2)
+
+        print(f"   → Done in {duration}s | oldest = {oldest}")
+
+        oldest_results.append({
+            "schema": schema,
+            "table": table,
+            "oldest_business_day": oldest,
+            "runtime_sec": duration
+        })
+
+    except Exception as e:
+        print(f"   → Skipped {schema}.{table}: {e}")
+
+oldest_business_day_df = pd.DataFrame(oldest_results)
