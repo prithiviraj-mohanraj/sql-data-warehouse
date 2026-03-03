@@ -1,114 +1,73 @@
+sf_columns = session.sql(f"""
+SELECT
+    lower(table_schema) AS schema,
+    lower(table_name) AS table,
+    lower(column_name) AS column,
+    lower(data_type) AS data_type,
+    numeric_precision,
+    numeric_scale
+FROM prod.information_schema.columns
+WHERE lower(table_schema) IN ('{schema_list}')
+""").to_pandas()
+
 import re
 
-def parse_type(dtype):
+def extract_precision(dtype):
     if pd.isna(dtype):
-        return None, None, None
+        return None, None
 
     dtype = dtype.lower()
 
-    # Extract base type
-    base = re.split(r'\(|\s', dtype)[0]
-
-    # Extract precision & scale
-    match = re.search(r'\((\d+)(?:,(\d+))?\)', dtype)
-
+    match = re.search(r'\((\d+),\s*(\d+)\)', dtype)
     if match:
-        precision = int(match.group(1))
-        scale = int(match.group(2)) if match.group(2) else None
-    else:
-        precision = None
-        scale = None
+        return int(match.group(1)), int(match.group(2))
 
-    return base, precision, scale
+    return None, None
 
+cloudera_columns[['precision','scale']] = cloudera_columns.apply(
+    lambda row: pd.Series(extract_precision(row['data_type'])),
+    axis=1
+)
 
-cloudera_columns[['base_type','precision','scale']] = \
-    cloudera_columns['data_type'].apply(lambda x: pd.Series(parse_type(x)))
-
-sf_columns[['base_type','precision','scale']] = \
-    sf_columns['data_type'].apply(lambda x: pd.Series(parse_type(x)))
-
-def normalize_base(base):
-    mapping = {
-        "string": "string",
-        "varchar": "string",
-        "char": "string",
-        "text": "string",
-
-        "int": "number",
-        "bigint": "number",
-        "smallint": "number",
-        "tinyint": "number",
-        "decimal": "number",
-        "numeric": "number",
-        "number": "number",
-
-        "double": "float",
-        "float": "float",
-
-        "timestamp": "timestamp",
-        "timestamp_ntz": "timestamp",
-        "timestamp_ltz": "timestamp",
-
-        "date": "date",
-        "boolean": "boolean",
-        "bool": "boolean"
-    }
-
-    return mapping.get(base, base)
-
-cloudera_columns['norm_base'] = cloudera_columns['base_type'].apply(normalize_base)
-sf_columns['norm_base'] = sf_columns['base_type'].apply(normalize_base)
-
-datatype_compare = cloudera_columns.merge(
+precision_compare = cloudera_columns.merge(
     sf_columns,
     on=['schema','table','column'],
     how='left',
     suffixes=('_cloudera','_snowflake')
 )
 
-def classify_precision(row):
+def is_numeric(dtype):
+    if pd.isna(dtype):
+        return False
+    return any(x in dtype for x in ['decimal','numeric','number','int','bigint'])
+def precision_status(row):
 
-    if pd.isna(row['norm_base_snowflake']):
+    if not is_numeric(row['data_type_cloudera']):
+        return "NOT_NUMERIC"
+
+    # If Snowflake missing
+    if pd.isna(row['data_type_snowflake']):
         return "MISSING_IN_SNOWFLAKE"
 
-    # Base type mismatch
-    if row['norm_base_cloudera'] != row['norm_base_snowflake']:
-        return "TYPE_MISMATCH"
+    # Compare precision
+    if row['precision'] == row['numeric_precision'] and \
+       row['scale'] == row['numeric_scale']:
+        return "MATCH"
 
-    # Only check precision for numeric
-    if row['norm_base_cloudera'] == "number":
+    return "MISMATCH"
 
-        if row['precision_cloudera'] != row['precision_snowflake']:
-            return "PRECISION_MISMATCH"
+precision_compare['precision_status'] = precision_compare.apply(
+    precision_status,
+    axis=1
+)
 
-        if row['scale_cloudera'] != row['scale_snowflake']:
-            return "SCALE_MISMATCH"
+precision_mismatch = precision_compare[
+    precision_compare['precision_status'] == "MISMATCH"
+]
 
-    return "MATCH"
+summary_precision = (
+    precision_mismatch.groupby('schema')
+    .size()
+    .reset_index(name='precision_mismatch_count')
+)
 
-datatype_compare['datatype_status'] = \
-    datatype_compare.apply(classify_precision, axis=1)
-
-def classify_precision(row):
-
-    # Missing column in Snowflake
-    if pd.isna(row['norm_base_snowflake']):
-        return "MISSING_IN_SNOWFLAKE"
-
-    # Base datatype mismatch
-    if row['norm_base_cloudera'] != row['norm_base_snowflake']:
-        return "TYPE_MISMATCH"
-
-    # Only validate precision for numeric types
-    if row['norm_base_cloudera'] == "number":
-
-        # Precision mismatch
-        if row['precision_cloudera'] != row['precision_snowflake']:
-            return "PRECISION_MISMATCH"
-
-        # Scale mismatch
-        if row['scale_cloudera'] != row['scale_snowflake']:
-            return "SCALE_MISMATCH"
-
-    return "MATCH"
