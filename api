@@ -1,5 +1,114 @@
+import re
 
-nohup ./scripts/run_businessday_counts.sh > logs/businessday_run.log 2>&1 &
+def parse_type(dtype):
+    if pd.isna(dtype):
+        return None, None, None
 
-tail -f logs/businessday_run.log
+    dtype = dtype.lower()
 
+    # Extract base type
+    base = re.split(r'\(|\s', dtype)[0]
+
+    # Extract precision & scale
+    match = re.search(r'\((\d+)(?:,(\d+))?\)', dtype)
+
+    if match:
+        precision = int(match.group(1))
+        scale = int(match.group(2)) if match.group(2) else None
+    else:
+        precision = None
+        scale = None
+
+    return base, precision, scale
+
+
+cloudera_columns[['base_type','precision','scale']] = \
+    cloudera_columns['data_type'].apply(lambda x: pd.Series(parse_type(x)))
+
+sf_columns[['base_type','precision','scale']] = \
+    sf_columns['data_type'].apply(lambda x: pd.Series(parse_type(x)))
+
+def normalize_base(base):
+    mapping = {
+        "string": "string",
+        "varchar": "string",
+        "char": "string",
+        "text": "string",
+
+        "int": "number",
+        "bigint": "number",
+        "smallint": "number",
+        "tinyint": "number",
+        "decimal": "number",
+        "numeric": "number",
+        "number": "number",
+
+        "double": "float",
+        "float": "float",
+
+        "timestamp": "timestamp",
+        "timestamp_ntz": "timestamp",
+        "timestamp_ltz": "timestamp",
+
+        "date": "date",
+        "boolean": "boolean",
+        "bool": "boolean"
+    }
+
+    return mapping.get(base, base)
+
+cloudera_columns['norm_base'] = cloudera_columns['base_type'].apply(normalize_base)
+sf_columns['norm_base'] = sf_columns['base_type'].apply(normalize_base)
+
+datatype_compare = cloudera_columns.merge(
+    sf_columns,
+    on=['schema','table','column'],
+    how='left',
+    suffixes=('_cloudera','_snowflake')
+)
+
+def classify_precision(row):
+
+    if pd.isna(row['norm_base_snowflake']):
+        return "MISSING_IN_SNOWFLAKE"
+
+    # Base type mismatch
+    if row['norm_base_cloudera'] != row['norm_base_snowflake']:
+        return "TYPE_MISMATCH"
+
+    # Only check precision for numeric
+    if row['norm_base_cloudera'] == "number":
+
+        if row['precision_cloudera'] != row['precision_snowflake']:
+            return "PRECISION_MISMATCH"
+
+        if row['scale_cloudera'] != row['scale_snowflake']:
+            return "SCALE_MISMATCH"
+
+    return "MATCH"
+
+datatype_compare['datatype_status'] = \
+    datatype_compare.apply(classify_precision, axis=1)
+
+def classify_precision(row):
+
+    # Missing column in Snowflake
+    if pd.isna(row['norm_base_snowflake']):
+        return "MISSING_IN_SNOWFLAKE"
+
+    # Base datatype mismatch
+    if row['norm_base_cloudera'] != row['norm_base_snowflake']:
+        return "TYPE_MISMATCH"
+
+    # Only validate precision for numeric types
+    if row['norm_base_cloudera'] == "number":
+
+        # Precision mismatch
+        if row['precision_cloudera'] != row['precision_snowflake']:
+            return "PRECISION_MISMATCH"
+
+        # Scale mismatch
+        if row['scale_cloudera'] != row['scale_snowflake']:
+            return "SCALE_MISMATCH"
+
+    return "MATCH"
