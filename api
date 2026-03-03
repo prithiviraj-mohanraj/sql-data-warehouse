@@ -1,87 +1,39 @@
+scripts/generate_businessday_count_sql.sh
+#!/bin/bash
 
-schema_list = "','".join(schemas['schema'])
-sf_columns = session.sql(f"""
-SELECT
-    lower(table_schema) AS schema,
-    lower(table_name) AS table,
-    lower(column_name) AS column,
-    lower(data_type) AS data_type
-FROM prod.information_schema.columns
-WHERE lower(table_schema) IN ('{schema_list}')
-""").to_pandas()
+TABLE_FILE="../input/sl1_tables.csv"
+BUSINESS_DAY=$(cat ../input/business_day.txt)
 
-import re
+SQL_FILE="../logs/businessday_${BUSINESS_DAY}_counts.sql"
 
-def normalize_type(dtype):
-    if pd.isna(dtype):
-        return None
+> $SQL_FILE
 
-    dtype = dtype.lower()
+tail -n +2 $TABLE_FILE | while IFS=',' read SCHEMA TABLE
+do
+    echo "SELECT '${SCHEMA}','${TABLE}','${BUSINESS_DAY}', COUNT(*) 
+          FROM ${SCHEMA}.${TABLE}
+          WHERE business_day='${BUSINESS_DAY}';" >> $SQL_FILE
+done
 
-    # remove precision: number(38,0) → number
-    base = re.split(r'\(|\s', dtype)[0]
-
-    mapping = {
-        # STRING
-        "string": "string",
-        "varchar": "string",
-        "char": "string",
-        "text": "string",
-
-        # NUMERIC
-        "int": "number",
-        "bigint": "number",
-        "smallint": "number",
-        "tinyint": "number",
-        "decimal": "number",
-        "numeric": "number",
-        "number": "number",
-
-        # FLOAT
-        "double": "float",
-        "float": "float",
-
-        # DATE/TIME
-        "date": "date",
-        "timestamp": "timestamp",
-        "timestamp_ntz": "timestamp",
-        "timestamp_ltz": "timestamp",
-        "timestamp_tz": "timestamp",
-
-        # BOOLEAN
-        "boolean": "boolean",
-        "bool": "boolean",
-
-        # COMPLEX
-        "array": "array",
-        "variant": "variant",
-    }
-
-    return mapping.get(base, base)
+echo "SQL generated → $SQL_FILE"
 
 
-cloudera_columns['normalized_type'] = cloudera_columns['data_type'].apply(normalize_type)
-sf_columns['normalized_type'] = sf_columns['data_type'].apply(normalize_type)
+scripts/run_businessday_counts.sh
 
-cloudera_columns['normalized_type'] = cloudera_columns['data_type'].apply(normalize_type)
-sf_columns['normalized_type'] = sf_columns['data_type'].apply(normalize_type)
+#!/bin/bash
 
-datatype_compare = cloudera_columns.merge(
-    sf_columns,
-    on=['schema','table','column'],
-    how='left',
-    suffixes=('_cloudera','_snowflake')
-)
+BUSINESS_DAY=$(cat ../input/business_day.txt)
 
-def classify_datatype(row):
-    if pd.isna(row['normalized_type_snowflake']):
-        return "MISSING_IN_SNOWFLAKE"
+SQL_FILE="../logs/businessday_${BUSINESS_DAY}_counts.sql"
+RAW_OUT="../logs/businessday_${BUSINESS_DAY}_raw.txt"
+OUT_FILE="../output/businessday_${BUSINESS_DAY}_counts.csv"
 
-    if row['normalized_type_cloudera'] == row['normalized_type_snowflake']:
-        return "MATCH"
+echo "schema,table,business_day,record_count" > $OUT_FILE
 
-    return "MISMATCH"
+impala-shell -k -i your-host -f $SQL_FILE -B > $RAW_OUT
 
-datatype_compare['datatype_status'] = datatype_compare.apply(classify_datatype, axis=1)
+# Clean and format output
+awk -F'\t' 'NF>=4 {print $1","$2","$3","$4}' $RAW_OUT >> $OUT_FILE
 
+echo "Output saved → $OUT_FILE"
 
