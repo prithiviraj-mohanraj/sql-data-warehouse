@@ -1,39 +1,5 @@
-scripts/generate_businessday_count_sql.sh
-#!/bin/bash
 
-TABLE_FILE="../input/sl1_tables.csv"
-BUSINESS_DAY=$(cat ../input/business_day.txt)
+nohup ./scripts/run_businessday_counts.sh > logs/businessday_run.log 2>&1 &
 
-SQL_FILE="../logs/businessday_${BUSINESS_DAY}_counts.sql"
-
-> $SQL_FILE
-
-tail -n +2 $TABLE_FILE | while IFS=',' read SCHEMA TABLE
-do
-    echo "SELECT '${SCHEMA}','${TABLE}','${BUSINESS_DAY}', COUNT(*) 
-          FROM ${SCHEMA}.${TABLE}
-          WHERE business_day='${BUSINESS_DAY}';" >> $SQL_FILE
-done
-
-echo "SQL generated → $SQL_FILE"
-
-
-scripts/run_businessday_counts.sh
-
-#!/bin/bash
-
-BUSINESS_DAY=$(cat ../input/business_day.txt)
-
-SQL_FILE="../logs/businessday_${BUSINESS_DAY}_counts.sql"
-RAW_OUT="../logs/businessday_${BUSINESS_DAY}_raw.txt"
-OUT_FILE="../output/businessday_${BUSINESS_DAY}_counts.csv"
-
-echo "schema,table,business_day,record_count" > $OUT_FILE
-
-impala-shell -k -i your-host -f $SQL_FILE -B > $RAW_OUT
-
-# Clean and format output
-awk -F'\t' 'NF>=4 {print $1","$2","$3","$4}' $RAW_OUT >> $OUT_FILE
-
-echo "Output saved → $OUT_FILE"
+tail -f logs/businessday_run.log
 
