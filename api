@@ -1,8 +1,79 @@
+prepare_businessdate_tables.py
+import pandas as pd
 
-SELECT
-TABLE_SCHEMA,
-TABLE_NAME,
-ROW_COUNT,
-ACTIVE_BYTES/1024/1024/1024 AS SIZE_GB
-FROM SNOWFLAKE.ACCOUNT_USAGE.TABLES
-WHERE TABLE_NAME = 'YOUR_TABLE';
+# read pipe file
+df = pd.read_csv("sl1_table_columns.psv", sep="|")
+
+df.columns = df.columns.str.lower()
+
+# keep only _h and _t2 tables
+df = df[df['table'].str.endswith(('_h','_t2'))]
+
+# normalize column names
+df['column'] = df['column'].str.lower()
+
+# identify tables
+ods_tables = df[df['column'] == 'ods_business_day'][['schema','table']]
+kafka_tables = df[df['column'] == 'kafka_process_dt'][['schema','table']]
+
+ods_tables['date_column'] = 'ods_business_day'
+kafka_tables['date_column'] = 'kafka_process_dt'
+
+# merge logic
+tables_with_dates = pd.concat([ods_tables, kafka_tables]).drop_duplicates()
+
+# tables that exist but no date column
+all_tables = df[['schema','table']].drop_duplicates()
+
+tables_without_dates = all_tables.merge(
+    tables_with_dates[['schema','table']],
+    on=['schema','table'],
+    how='left',
+    indicator=True
+)
+
+tables_without_dates = tables_without_dates[
+    tables_without_dates['_merge']=='left_only'
+][['schema','table']]
+
+# save outputs
+tables_with_dates.to_csv("tables_with_dates.csv", index=False)
+tables_without_dates.to_csv("tables_without_dates.csv", index=False)
+
+print("Tables with business/kafka date:", len(tables_with_dates))
+print("Tables excluded:", len(tables_without_dates))
+
+generate_min_date_sql.sh
+#!/bin/bash
+
+INPUT="tables_with_dates.csv"
+OUTSQL="min_businessdate_queries.sql"
+
+echo "" > $OUTSQL
+
+tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE DATECOL
+do
+
+echo "SELECT '$SCHEMA','$TABLE','$DATECOL', MIN($DATECOL)
+FROM $SCHEMA.$TABLE;" >> $OUTSQL
+
+done
+
+echo "SQL generated in $OUTSQL"
+
+run_min_date.sh
+#!/bin/bash
+
+SQLFILE="min_businessdate_queries.sql"
+OUTFILE="min_businessdate_results.csv"
+
+echo "schema,table,date_column,min_date" > $OUTFILE
+
+impala-shell -k -i your-host -f $SQLFILE -B \
+| awk -F'\t' '{print $1","$2","$3","$4}' >> $OUTFILE
+
+nohup ./run_min_date.sh > min_date_job.log 2>&1 &
+
+tail -f min_date_job.log
+ps -ef | grep run_min_date
+
