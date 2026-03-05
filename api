@@ -1,113 +1,89 @@
-prepare_businessdate_tables.py
+scripts/filter_businessdate_tables.py
 import pandas as pd
 
-# read pipe file
-df = pd.read_csv("sl1_table_columns.psv", sep="|")
+INPUT="../input/sl1_table_columns.psv"
 
-df.columns = df.columns.str.lower()
+df = pd.read_csv(INPUT, sep="|")
 
-# keep only _h and _t2 tables
+df.columns=["schema","table","column","datatype"]
+
+df['schema']=df['schema'].str.lower()
+df['table']=df['table'].str.lower()
+df['column']=df['column'].str.lower()
+
+# only _h and _t2
 df = df[df['table'].str.endswith(('_h','_t2'))]
 
-# normalize column names
-df['column'] = df['column'].str.lower()
+kafka_tables = df[df['column']=="kafka_process_dt"][["schema","table"]].drop_duplicates()
+ods_tables   = df[df['column']=="ods_business_day"][["schema","table"]].drop_duplicates()
 
-# identify tables
-ods_tables = df[df['column'] == 'ods_business_day'][['schema','table']]
-kafka_tables = df[df['column'] == 'kafka_process_dt'][['schema','table']]
+kafka_tables["date_column"]="kafka_process_dt"
+ods_tables["date_column"]="ods_business_day"
 
-ods_tables['date_column'] = 'ods_business_day'
-kafka_tables['date_column'] = 'kafka_process_dt'
-
-# merge logic
-tables_with_dates = pd.concat([ods_tables, kafka_tables]).drop_duplicates()
-
-# tables that exist but no date column
-all_tables = df[['schema','table']].drop_duplicates()
-
-tables_without_dates = all_tables.merge(
-    tables_with_dates[['schema','table']],
-    on=['schema','table'],
-    how='left',
+# remove duplicates where kafka exists
+ods_tables = ods_tables.merge(
+    kafka_tables[["schema","table"]],
+    on=["schema","table"],
+    how="left",
     indicator=True
 )
 
-tables_without_dates = tables_without_dates[
-    tables_without_dates['_merge']=='left_only'
-][['schema','table']]
+ods_tables = ods_tables[ods_tables["_merge"]=="left_only"][["schema","table","date_column"]]
 
-# save outputs
-tables_with_dates.to_csv("tables_with_dates.csv", index=False)
-tables_without_dates.to_csv("tables_without_dates.csv", index=False)
+valid_tables = pd.concat([kafka_tables,ods_tables])
 
-print("Tables with business/kafka date:", len(tables_with_dates))
-print("Tables excluded:", len(tables_without_dates))
+all_tables = df[["schema","table"]].drop_duplicates()
 
-generate_min_date_sql.sh
+excluded_tables = all_tables.merge(
+    valid_tables[["schema","table"]],
+    on=["schema","table"],
+    how="left",
+    indicator=True
+)
+
+excluded_tables = excluded_tables[excluded_tables["_merge"]=="left_only"][["schema","table"]]
+
+valid_tables.to_csv("../intermediate/tables_with_businessdate.csv",index=False)
+excluded_tables.to_csv("../intermediate/tables_without_businessdate.csv",index=False)
+
+print("tables with date column:",len(valid_tables))
+print("tables excluded:",len(excluded_tables))
+
+scripts/generate_min_date_sql.sh
 #!/bin/bash
 
-INPUT="tables_with_dates.csv"
-OUTSQL="min_businessdate_queries.sql"
+INPUT="../intermediate/tables_with_businessdate.csv"
+OUT="../logs/min_date_queries.sql"
 
-echo "" > $OUTSQL
+> $OUT
 
-tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE DATECOL
+tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE COL
 do
-
-echo "SELECT '$SCHEMA','$TABLE','$DATECOL', MIN($DATECOL)
-FROM $SCHEMA.$TABLE;" >> $OUTSQL
-
+echo "SELECT '${SCHEMA}','${TABLE}','${COL}',MIN(${COL}) FROM ${SCHEMA}.${TABLE};" >> $OUT
 done
 
-echo "SQL generated in $OUTSQL"
+echo "SQL generated: $OUT"
 
-run_min_date.sh
-#!/bin/bash
-
-SQLFILE="min_businessdate_queries.sql"
-OUTFILE="min_businessdate_results.csv"
-
-echo "schema,table,date_column,min_date" > $OUTFILE
-
-impala-shell -k -i your-host -f $SQLFILE -B \
-| awk -F'\t' '{print $1","$2","$3","$4}' >> $OUTFILE
-
-nohup ./run_min_date.sh > min_date_job.log 2>&1 &
-
-tail -f min_date_job.log
-ps -ef | grep run_min_date
-
-generate_count_sql.sh
-#!/bin/bash
-
-INPUT="min_businessdate_results.csv"
-OUTSQL="count_queries.sql"
-
-> $OUTSQL
-
-tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE DATECOL DATEVAL
-do
-
-echo "SELECT '$SCHEMA','$TABLE','$DATECOL','$DATEVAL', COUNT(*)
-FROM $SCHEMA.$TABLE
-WHERE $DATECOL = '$DATEVAL';" >> $OUTSQL
-
-done
-
-echo "Count SQL generated: $OUTSQL"
-
-run_counts.sh
+scripts/run_min_date.sh
 
 #!/bin/bash
 
-SQLFILE="count_queries.sql"
-OUTFILE="businessdate_counts.csv"
+SQL="../logs/min_date_queries.sql"
+RAW="../logs/min_dates_raw.txt"
+OUT="../output/min_business_dates.csv"
 
-echo "schema,table,date_column,date,count" > $OUTFILE
+echo "schema,table,date_column,min_date" > $OUT
 
-impala-shell -k -i your-host -f $SQLFILE -B \
-| awk -F'\t' '{print $1","$2","$3","$4","$5}' >> $OUTFILE
+impala-shell -k -i your-host -f $SQL -B > $RAW
 
-echo "Count results saved in $OUTFILE"
-nohup ./run_counts.sh > count_job.log 2>&1 &
+awk -F'\t' 'NF>=4 {print $1","$2","$3","$4}' $RAW >> $OUT
+
+echo "completed"
+
+
+nohup ./scripts/run_min_date.sh > logs/min_date_run.log 2>&1 &
+
+
+tail -f logs/min_date_run.log
+
 
