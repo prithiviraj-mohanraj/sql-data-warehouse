@@ -77,3 +77,37 @@ nohup ./run_min_date.sh > min_date_job.log 2>&1 &
 tail -f min_date_job.log
 ps -ef | grep run_min_date
 
+generate_count_sql.sh
+#!/bin/bash
+
+INPUT="min_businessdate_results.csv"
+OUTSQL="count_queries.sql"
+
+> $OUTSQL
+
+tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE DATECOL DATEVAL
+do
+
+echo "SELECT '$SCHEMA','$TABLE','$DATECOL','$DATEVAL', COUNT(*)
+FROM $SCHEMA.$TABLE
+WHERE $DATECOL = '$DATEVAL';" >> $OUTSQL
+
+done
+
+echo "Count SQL generated: $OUTSQL"
+
+run_counts.sh
+
+#!/bin/bash
+
+SQLFILE="count_queries.sql"
+OUTFILE="businessdate_counts.csv"
+
+echo "schema,table,date_column,date,count" > $OUTFILE
+
+impala-shell -k -i your-host -f $SQLFILE -B \
+| awk -F'\t' '{print $1","$2","$3","$4","$5}' >> $OUTFILE
+
+echo "Count results saved in $OUTFILE"
+nohup ./run_counts.sh > count_job.log 2>&1 &
+
