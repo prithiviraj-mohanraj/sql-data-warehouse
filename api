@@ -87,3 +87,41 @@ nohup ./scripts/run_min_date.sh > logs/min_date_run.log 2>&1 &
 tail -f logs/min_date_run.log
 
 
+scripts/generate_min_date_count_sql.sh
+#!/bin/bash
+
+INPUT="../output/min_business_dates.csv"
+SQL="../logs/min_date_count_queries.sql"
+
+> $SQL
+
+tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE COL DATE
+do
+
+echo "SELECT '${SCHEMA}','${TABLE}','${COL}','${DATE}',COUNT(*) 
+FROM ${SCHEMA}.${TABLE} 
+WHERE ${COL}='${DATE}';" >> $SQL
+
+done
+
+echo "SQL created → $SQL"
+
+
+scripts/run_min_date_counts.sh
+#!/bin/bash
+
+SQL="../logs/min_date_count_queries.sql"
+RAW="../logs/min_date_counts_raw.txt"
+OUT="../output/min_date_counts.csv"
+
+echo "schema,table,date_column,min_date,record_count" > $OUT
+
+impala-shell -k -i your-host -f $SQL -B > $RAW
+
+awk -F'\t' 'NF>=5 {print $1","$2","$3","$4","$5}' $RAW >> $OUT
+
+echo "count extraction completed"
+
+nohup ./scripts/run_min_date_counts.sh > logs/min_date_counts.log 2>&1 &
+tail -f logs/min_date_counts.log
+
