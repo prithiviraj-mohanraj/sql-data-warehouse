@@ -1,102 +1,22 @@
-scripts/filter_businessdate_tables.py
-import pandas as pd
-
-INPUT="../input/sl1_table_columns.psv"
-
-df = pd.read_csv(INPUT, sep="|")
-
-df.columns=["schema","table","column","datatype"]
-
-df['schema']=df['schema'].str.lower()
-df['table']=df['table'].str.lower()
-df['column']=df['column'].str.lower()
-
-# only _h and _t2
-df = df[df['table'].str.endswith(('_h','_t2'))]
-
-kafka_tables = df[df['column']=="kafka_process_dt"][["schema","table"]].drop_duplicates()
-ods_tables   = df[df['column']=="ods_business_day"][["schema","table"]].drop_duplicates()
-
-kafka_tables["date_column"]="kafka_process_dt"
-ods_tables["date_column"]="ods_business_day"
-
-# remove duplicates where kafka exists
-ods_tables = ods_tables.merge(
-    kafka_tables[["schema","table"]],
-    on=["schema","table"],
-    how="left",
-    indicator=True
-)
-
-ods_tables = ods_tables[ods_tables["_merge"]=="left_only"][["schema","table","date_column"]]
-
-valid_tables = pd.concat([kafka_tables,ods_tables])
-
-all_tables = df[["schema","table"]].drop_duplicates()
-
-excluded_tables = all_tables.merge(
-    valid_tables[["schema","table"]],
-    on=["schema","table"],
-    how="left",
-    indicator=True
-)
-
-excluded_tables = excluded_tables[excluded_tables["_merge"]=="left_only"][["schema","table"]]
-
-valid_tables.to_csv("../intermediate/tables_with_businessdate.csv",index=False)
-excluded_tables.to_csv("../intermediate/tables_without_businessdate.csv",index=False)
-
-print("tables with date column:",len(valid_tables))
-print("tables excluded:",len(excluded_tables))
-
-scripts/generate_min_date_sql.sh
-#!/bin/bash
-
-INPUT="../intermediate/tables_with_businessdate.csv"
-OUT="../logs/min_date_queries.sql"
-
-> $OUT
-
-tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE COL
-do
-echo "SELECT '${SCHEMA}','${TABLE}','${COL}',MIN(${COL}) FROM ${SCHEMA}.${TABLE};" >> $OUT
-done
-
-echo "SQL generated: $OUT"
-
-scripts/run_min_date.sh
-
-#!/bin/bash
-
-SQL="../logs/min_date_queries.sql"
-RAW="../logs/min_dates_raw.txt"
-OUT="../output/min_business_dates.csv"
-
-echo "schema,table,date_column,min_date" > $OUT
-
-impala-shell -k -i your-host -f $SQL -B > $RAW
-
-awk -F'\t' 'NF>=4 {print $1","$2","$3","$4}' $RAW >> $OUT
-
-echo "completed"
-
-
-nohup ./scripts/run_min_date.sh > logs/min_date_run.log 2>&1 &
-
-
-tail -f logs/min_date_run.log
-
-
 scripts/generate_min_date_count_sql.sh
 #!/bin/bash
 
 INPUT="../output/min_business_dates.csv"
+
 SQL="../logs/min_date_count_queries.sql"
+NULL_TABLES="../output/tables_with_null_mindate.csv"
 
 > $SQL
+echo "schema,table,date_column,min_date" > $NULL_TABLES
 
 tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE COL DATE
 do
+
+# detect null / empty
+if [[ -z "$DATE" || "$DATE" == "NULL" ]]; then
+    echo "$SCHEMA,$TABLE,$COL,$DATE" >> $NULL_TABLES
+    continue
+fi
 
 echo "SELECT '${SCHEMA}','${TABLE}','${COL}','${DATE}',COUNT(*) 
 FROM ${SCHEMA}.${TABLE} 
@@ -104,10 +24,11 @@ WHERE ${COL}='${DATE}';" >> $SQL
 
 done
 
-echo "SQL created → $SQL"
-
+echo "SQL generated: $SQL"
+echo "Null date tables saved: $NULL_TABLES"
 
 scripts/run_min_date_counts.sh
+
 #!/bin/bash
 
 SQL="../logs/min_date_count_queries.sql"
@@ -123,5 +44,65 @@ awk -F'\t' 'NF>=5 {print $1","$2","$3","$4","$5}' $RAW >> $OUT
 echo "count extraction completed"
 
 nohup ./scripts/run_min_date_counts.sh > logs/min_date_counts.log 2>&1 &
-tail -f logs/min_date_counts.log
+
+
+
+import pandas as pd
+
+cloudera_counts = pd.read_csv("min_date_counts.csv")
+
+cloudera_counts['schema'] = cloudera_counts['schema'].str.lower()
+cloudera_counts['table'] = cloudera_counts['table'].str.lower()
+
+cloudera_counts = cloudera_counts[cloudera_counts['min_date'].notna()]
+
+
+snowflake_results = []
+
+for i,row in cloudera_counts.iterrows():
+
+    schema = row['schema']
+    table = row['table']
+    column = row['date_column']
+    date = row['min_date']
+
+    query = f"""
+    SELECT
+        '{schema}' AS schema,
+        '{table}' AS table,
+        '{column}' AS date_column,
+        '{date}' AS min_date,
+        COUNT(*) AS record_count
+    FROM prod.{schema}.{table}
+    WHERE {column} = '{date}'
+    """
+
+    try:
+        df = session.sql(query).to_pandas()
+        snowflake_results.append(df.iloc[0].to_dict())
+        print(f"{schema}.{table} completed")
+
+    except Exception as e:
+        print(f"{schema}.{table} failed")
+
+snowflake_counts = pd.DataFrame(snowflake_results)
+
+comparison = cloudera_counts.merge(
+    snowflake_counts,
+    on=['schema','table','date_column','min_date'],
+    how='left',
+    suffixes=('_cloudera','_snowflake')
+)
+
+comparison['match'] = (
+    comparison['record_count_cloudera'] ==
+    comparison['record_count_snowflake']
+)
+
+mismatch = comparison[comparison['match']==False]
+mismatch
+
+print("Total tables:", len(comparison))
+print("Matched:", comparison['match'].sum())
+print("Mismatch:", len(mismatch))
 
