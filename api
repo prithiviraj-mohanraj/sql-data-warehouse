@@ -1,62 +1,95 @@
-cloudera_h = cloudera_columns[
-    cloudera_columns['table'].str.endswith('_h')
+Email
+Subject
+Methodology for Identifying Unhealthy Tables in Snowflake
+Hi Team,
+As part of the Snowflake validation, I evaluated table health using Snowflake’s clustering metadata.
+Approach used:
+Used the SYSTEM$CLUSTERING_INFORMATION() function to retrieve clustering metrics for each table.
+The clustering column used for analysis was selected based on table type:
+Streaming tables → kafka_process_dt
+Other tables → ods_business_day
+These columns were identified from the earlier column inventory extracted from Cloudera.
+Metrics analyzed from clustering metadata:
+total_partition_count
+constant_partition_count
+average_depth
+average_overlaps
+Criteria used to classify table health:
+A table was marked Unhealthy if any of the following conditions were met:
+average_depth > 5
+average_overlaps > 5
+constant_partition_ratio < 0.5
+(where constant_partition_ratio = constant_partition_count / total_partition_count)
+Tables not meeting these conditions were classified as Healthy.
+These thresholds were used to identify tables where micro-partition pruning may be inefficient due to high partition overlap or deeper clustering depth.
+A report listing the tables identified as unhealthy has been generated for further review.
+Please let me know if any additional details are required.
+Thanks,
+Prithiv
+
+
+cluster_results = []
+
+for _,row in tables_with_date.iterrows():
+
+    schema = row['schema']
+    table = row['table']
+    column = row['date_column']
+
+    query = f"""
+    SELECT
+    PARSE_JSON(SYSTEM$CLUSTERING_INFORMATION(
+        'prod.{schema}.{table}',
+        '({column})'
+    )) AS cluster_info
+    """
+
+    try:
+        df = session.sql(query).to_pandas()
+
+        j = df['cluster_info'][0]
+
+        cluster_results.append({
+            "schema":schema,
+            "table":table,
+            "column":column,
+            "total_partition_count": j.get("total_partition_count"),
+            "constant_partition_count": j.get("constant_partition_count"),
+            "average_depth": j.get("average_depth"),
+            "average_overlaps": j.get("average_overlaps")
+        })
+
+        print(f"{schema}.{table} done")
+
+    except Exception as e:
+        print(f"{schema}.{table} failed")
+
+cluster_df = pd.DataFrame(cluster_results)
+
+cluster_df["constant_ratio"] = (
+    cluster_df["constant_partition_count"] /
+    cluster_df["total_partition_count"]
+)
+
+def table_health(row):
+
+    if row['average_depth'] > 5:
+        return "UNHEALTHY"
+
+    if row['average_overlaps'] > 5:
+        return "UNHEALTHY"
+
+    if row['constant_ratio'] < 0.5:
+        return "UNHEALTHY"
+
+    return "HEALTHY"
+
+
+cluster_df["table_health"] = cluster_df.apply(table_health,axis=1)
+
+unhealthy_tables = cluster_df[
+    cluster_df["table_health"]=="UNHEALTHY"
 ]
 
-sf_h = sf_columns[
-    sf_columns['table'].str.endswith('_h')
-]
+cluster_df["table_health"].value_counts()
 
-cloudera_tables_h = cloudera_h[['schema','table']].drop_duplicates()
-sf_tables_h = sf_h[['schema','table']].drop_duplicates()
-
-common_tables = cloudera_tables_h.merge(
-    sf_tables_h,
-    on=['schema','table'],
-    how='inner'
-)
-
-cloudera_h_common = cloudera_h.merge(
-    common_tables,
-    on=['schema','table'],
-    how='inner'
-)
-
-sf_h_common = sf_h.merge(
-    common_tables,
-    on=['schema','table'],
-    how='inner'
-)
-
-missing_columns = cloudera_h_common.merge(
-    sf_h_common,
-    on=['schema','table','column'],
-    how='left',
-    indicator=True
-)
-
-missing_columns = missing_columns[
-    missing_columns['_merge'] == 'left_only'
-][['schema','table','column']]
-
-extra_columns = sf_h_common.merge(
-    cloudera_h_common,
-    on=['schema','table','column'],
-    how='left',
-    indicator=True
-)
-
-extra_columns = extra_columns[
-    extra_columns['_merge'] == 'left_only'
-][['schema','table','column']]
-
-missing_summary = (
-    missing_columns.groupby(['schema','table'])
-    .size()
-    .reset_index(name='missing_columns')
-)
-
-extra_summary = (
-    extra_columns.groupby(['schema','table'])
-    .size()
-    .reset_index(name='extra_columns')
-)
