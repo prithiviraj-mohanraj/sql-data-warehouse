@@ -1,53 +1,33 @@
-Email
-Subject
-Methodology for Identifying Unhealthy Tables in Snowflake
-Hi Team,
-As part of the Snowflake validation, I evaluated table health using Snowflake’s clustering metadata.
-Approach used:
-Used the SYSTEM$CLUSTERING_INFORMATION() function to retrieve clustering metrics for each table.
-The clustering column used for analysis was selected based on table type:
-Streaming tables → kafka_process_dt
-Other tables → ods_business_day
-These columns were identified from the earlier column inventory extracted from Cloudera.
-Metrics analyzed from clustering metadata:
-total_partition_count
-constant_partition_count
-average_depth
-average_overlaps
-Criteria used to classify table health:
-A table was marked Unhealthy if any of the following conditions were met:
-average_depth > 5
-average_overlaps > 5
-constant_partition_ratio < 0.5
-(where constant_partition_ratio = constant_partition_count / total_partition_count)
-Tables not meeting these conditions were classified as Healthy.
-These thresholds were used to identify tables where micro-partition pruning may be inefficient due to high partition overlap or deeper clustering depth.
-A report listing the tables identified as unhealthy has been generated for further review.
-Please let me know if any additional details are required.
-Thanks,
-Prithiv
+import pandas as pd
 
+tables_df = pd.read_csv("min_date_counts.csv")
+
+tables_df['schema'] = tables_df['schema'].str.lower()
+tables_df['table'] = tables_df['table'].str.lower()
+tables_df['date_column'] = tables_df['date_column'].str.lower()
+
+tables_df.head()
 
 cluster_results = []
 
-for _,row in tables_with_date.iterrows():
+for _,row in tables_df.iterrows():
 
     schema = row['schema']
     table = row['table']
     column = row['date_column']
 
     query = f"""
-    SELECT
-    PARSE_JSON(SYSTEM$CLUSTERING_INFORMATION(
-        'prod.{schema}.{table}',
-        '({column})'
-    )) AS cluster_info
+    SELECT PARSE_JSON(
+        SYSTEM$CLUSTERING_INFORMATION(
+            'PROD.{schema}.{table}',
+            '({column})'
+        )
+    ) AS info
     """
 
     try:
         df = session.sql(query).to_pandas()
-
-        j = df['cluster_info'][0]
+        j = df['INFO'][0]
 
         cluster_results.append({
             "schema":schema,
@@ -59,19 +39,21 @@ for _,row in tables_with_date.iterrows():
             "average_overlaps": j.get("average_overlaps")
         })
 
-        print(f"{schema}.{table} done")
+        print(f"{schema}.{table} completed")
 
     except Exception as e:
         print(f"{schema}.{table} failed")
 
 cluster_df = pd.DataFrame(cluster_results)
 
+cluster_df.head()
+
 cluster_df["constant_ratio"] = (
     cluster_df["constant_partition_count"] /
     cluster_df["total_partition_count"]
 )
 
-def table_health(row):
+def check_health(row):
 
     if row['average_depth'] > 5:
         return "UNHEALTHY"
@@ -85,11 +67,12 @@ def table_health(row):
     return "HEALTHY"
 
 
-cluster_df["table_health"] = cluster_df.apply(table_health,axis=1)
+cluster_df["table_health"] = cluster_df.apply(check_health, axis=1)
 
 unhealthy_tables = cluster_df[
-    cluster_df["table_health"]=="UNHEALTHY"
+    cluster_df["table_health"] == "UNHEALTHY"
 ]
 
-cluster_df["table_health"].value_counts()
+unhealthy_tables
 
+cluster_df["table_health"].value_counts()
