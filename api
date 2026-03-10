@@ -1,108 +1,44 @@
-scripts/generate_min_date_count_sql.sh
-#!/bin/bash
+sf_sl1 = sf_schemas[sf_schemas['name'].str.startswith('sl1')]
 
-INPUT="../output/min_business_dates.csv"
-
-SQL="../logs/min_date_count_queries.sql"
-NULL_TABLES="../output/tables_with_null_mindate.csv"
-
-> $SQL
-echo "schema,table,date_column,min_date" > $NULL_TABLES
-
-tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE COL DATE
-do
-
-# detect null / empty
-if [[ -z "$DATE" || "$DATE" == "NULL" ]]; then
-    echo "$SCHEMA,$TABLE,$COL,$DATE" >> $NULL_TABLES
-    continue
-fi
-
-echo "SELECT '${SCHEMA}','${TABLE}','${COL}','${DATE}',COUNT(*) 
-FROM ${SCHEMA}.${TABLE} 
-WHERE ${COL}='${DATE}';" >> $SQL
-
-done
-
-echo "SQL generated: $SQL"
-echo "Null date tables saved: $NULL_TABLES"
-
-scripts/run_min_date_counts.sh
-
-#!/bin/bash
-
-SQL="../logs/min_date_count_queries.sql"
-RAW="../logs/min_date_counts_raw.txt"
-OUT="../output/min_date_counts.csv"
-
-echo "schema,table,date_column,min_date,record_count" > $OUT
-
-impala-shell -k -i your-host -f $SQL -B > $RAW
-
-awk -F'\t' 'NF>=5 {print $1","$2","$3","$4","$5}' $RAW >> $OUT
-
-echo "count extraction completed"
-
-nohup ./scripts/run_min_date_counts.sh > logs/min_date_counts.log 2>&1 &
-
-
-
-import pandas as pd
-
-cloudera_counts = pd.read_csv("min_date_counts.csv")
-
-cloudera_counts['schema'] = cloudera_counts['schema'].str.lower()
-cloudera_counts['table'] = cloudera_counts['table'].str.lower()
-
-cloudera_counts = cloudera_counts[cloudera_counts['min_date'].notna()]
-
-
-snowflake_results = []
-
-for i,row in cloudera_counts.iterrows():
-
-    schema = row['schema']
-    table = row['table']
-    column = row['date_column']
-    date = row['min_date']
-
-    query = f"""
-    SELECT
-        '{schema}' AS schema,
-        '{table}' AS table,
-        '{column}' AS date_column,
-        '{date}' AS min_date,
-        COUNT(*) AS record_count
-    FROM prod.{schema}.{table}
-    WHERE {column} = '{date}'
-    """
-
-    try:
-        df = session.sql(query).to_pandas()
-        snowflake_results.append(df.iloc[0].to_dict())
-        print(f"{schema}.{table} completed")
-
-    except Exception as e:
-        print(f"{schema}.{table} failed")
-
-snowflake_counts = pd.DataFrame(snowflake_results)
-
-comparison = cloudera_counts.merge(
-    snowflake_counts,
-    on=['schema','table','date_column','min_date'],
+extra_sf_schemas = sf_sl1.merge(
+    schemas,
+    left_on='name',
+    right_on='schema',
     how='left',
-    suffixes=('_cloudera','_snowflake')
+    indicator=True
 )
 
-comparison['match'] = (
-    comparison['record_count_cloudera'] ==
-    comparison['record_count_snowflake']
+extra_sf_schemas = extra_sf_schemas[
+    extra_sf_schemas['_merge']=='left_only'
+][['name']]
+
+extra_sf_schemas.rename(columns={'name':'schema'}, inplace=True)
+
+extra_sf_schemas
+
+cloudera_h_cols = cloudera_columns[
+    cloudera_columns['table'].str.endswith('_h')
+]
+
+sf_h_cols = sf_columns[
+    sf_columns['table'].str.endswith('_h')
+]
+
+extra_sf_columns = sf_h_cols.merge(
+    cloudera_h_cols,
+    on=['schema','table','column'],
+    how='left',
+    indicator=True
 )
 
-mismatch = comparison[comparison['match']==False]
-mismatch
+extra_sf_columns = extra_sf_columns[
+    extra_sf_columns['_merge']=='left_only'
+][['schema','table','column']]
+extra_column_summary = (
+    extra_sf_columns
+    .groupby(['schema','table'])
+    .size()
+    .reset_index(name='extra_columns')
+)
 
-print("Total tables:", len(comparison))
-print("Matched:", comparison['match'].sum())
-print("Mismatch:", len(mismatch))
 
