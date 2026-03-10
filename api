@@ -1,44 +1,62 @@
-sf_sl1 = sf_schemas[sf_schemas['name'].str.startswith('sl1')]
-
-extra_sf_schemas = sf_sl1.merge(
-    schemas,
-    left_on='name',
-    right_on='schema',
-    how='left',
-    indicator=True
-)
-
-extra_sf_schemas = extra_sf_schemas[
-    extra_sf_schemas['_merge']=='left_only'
-][['name']]
-
-extra_sf_schemas.rename(columns={'name':'schema'}, inplace=True)
-
-extra_sf_schemas
-
-cloudera_h_cols = cloudera_columns[
+cloudera_h = cloudera_columns[
     cloudera_columns['table'].str.endswith('_h')
 ]
 
-sf_h_cols = sf_columns[
+sf_h = sf_columns[
     sf_columns['table'].str.endswith('_h')
 ]
 
-extra_sf_columns = sf_h_cols.merge(
-    cloudera_h_cols,
+cloudera_tables_h = cloudera_h[['schema','table']].drop_duplicates()
+sf_tables_h = sf_h[['schema','table']].drop_duplicates()
+
+common_tables = cloudera_tables_h.merge(
+    sf_tables_h,
+    on=['schema','table'],
+    how='inner'
+)
+
+cloudera_h_common = cloudera_h.merge(
+    common_tables,
+    on=['schema','table'],
+    how='inner'
+)
+
+sf_h_common = sf_h.merge(
+    common_tables,
+    on=['schema','table'],
+    how='inner'
+)
+
+missing_columns = cloudera_h_common.merge(
+    sf_h_common,
     on=['schema','table','column'],
     how='left',
     indicator=True
 )
 
-extra_sf_columns = extra_sf_columns[
-    extra_sf_columns['_merge']=='left_only'
+missing_columns = missing_columns[
+    missing_columns['_merge'] == 'left_only'
 ][['schema','table','column']]
-extra_column_summary = (
-    extra_sf_columns
-    .groupby(['schema','table'])
+
+extra_columns = sf_h_common.merge(
+    cloudera_h_common,
+    on=['schema','table','column'],
+    how='left',
+    indicator=True
+)
+
+extra_columns = extra_columns[
+    extra_columns['_merge'] == 'left_only'
+][['schema','table','column']]
+
+missing_summary = (
+    missing_columns.groupby(['schema','table'])
+    .size()
+    .reset_index(name='missing_columns')
+)
+
+extra_summary = (
+    extra_columns.groupby(['schema','table'])
     .size()
     .reset_index(name='extra_columns')
 )
-
-
