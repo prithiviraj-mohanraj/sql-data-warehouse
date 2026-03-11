@@ -1,78 +1,31 @@
 import pandas as pd
 
-tables_df = pd.read_csv("min_date_counts.csv")
+tables = pd.read_csv("all_tables.csv")
 
-tables_df['schema'] = tables_df['schema'].str.lower()
-tables_df['table'] = tables_df['table'].str.lower()
-tables_df['date_column'] = tables_df['date_column'].str.lower()
-
-tables_df.head()
-
-cluster_results = []
-
-for _,row in tables_df.iterrows():
-
-    schema = row['schema']
-    table = row['table']
-    column = row['date_column']
-
-    query = f"""
-    SELECT PARSE_JSON(
-        SYSTEM$CLUSTERING_INFORMATION(
-            'PROD.{schema}.{table}',
-            '({column})'
-        )
-    ) AS info
-    """
-
-    try:
-        df = session.sql(query).to_pandas()
-        j = df['INFO'][0]
-
-        cluster_results.append({
-            "schema":schema,
-            "table":table,
-            "column":column,
-            "total_partition_count": j.get("total_partition_count"),
-            "constant_partition_count": j.get("constant_partition_count"),
-            "average_depth": j.get("average_depth"),
-            "average_overlaps": j.get("average_overlaps")
-        })
-
-        print(f"{schema}.{table} completed")
-
-    except Exception as e:
-        print(f"{schema}.{table} failed")
-
-cluster_df = pd.DataFrame(cluster_results)
-
-cluster_df.head()
-
-cluster_df["constant_ratio"] = (
-    cluster_df["constant_partition_count"] /
-    cluster_df["total_partition_count"]
+columns = pd.read_csv(
+    "snowflake_columns.psv",
+    sep="|",
+    names=["schema","table","column","datatype"]
 )
 
-def check_health(row):
+tables['schema'] = tables['schema'].str.lower()
+tables['table'] = tables['table'].str.lower()
 
-    if row['average_depth'] > 5:
-        return "UNHEALTHY"
+columns['schema'] = columns['schema'].str.lower()
+columns['table'] = columns['table'].str.lower()
 
-    if row['average_overlaps'] > 5:
-        return "UNHEALTHY"
+column_tables = columns[['schema','table']].drop_duplicates()
 
-    if row['constant_ratio'] < 0.5:
-        return "UNHEALTHY"
+missing_column_tables = tables.merge(
+    column_tables,
+    on=['schema','table'],
+    how='left',
+    indicator=True
+)
 
-    return "HEALTHY"
-
-
-cluster_df["table_health"] = cluster_df.apply(check_health, axis=1)
-
-unhealthy_tables = cluster_df[
-    cluster_df["table_health"] == "UNHEALTHY"
-]
-
-unhealthy_tables
-
-cluster_df["table_health"].value_counts()
+missing_column_tables = missing_column_tables[
+    missing_column_tables['_merge']=='left_only'
+][['schema','table']]
+print("Total tables:", len(tables))
+print("Tables with columns extracted:", len(column_tables))
+print("Tables missing column extraction:", len(missing_column_tables))
