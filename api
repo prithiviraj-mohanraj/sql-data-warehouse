@@ -1,3 +1,14 @@
+def build_sf_type(row):
+
+    dtype = str(row['datatype']).lower()
+
+    # handle numeric precision
+    if dtype == 'number' and pd.notna(row['numeric_precision']):
+        return f"number({int(row['numeric_precision'])},{int(row['numeric_scale'])})"
+
+    # for all other datatypes just return the base type
+    return dtype
+
 mapping = pd.read_csv("datatype_mapping.csv")
 
 mapping['hive_type'] = mapping['hive_type'].str.lower()
