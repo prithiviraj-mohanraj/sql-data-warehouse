@@ -1,177 +1,104 @@
-scripts/find_missing_column_tables.sh
-#!/bin/bash
+sf_columns = session.sql("""
+SELECT
+LOWER(table_schema) AS schema,
+LOWER(table_name) AS table,
+LOWER(column_name) AS column,
+LOWER(data_type) AS datatype,
+numeric_precision,
+numeric_scale,
+numeric_precision_radix
+FROM prod.information_schema.columns
+WHERE LOWER(table_schema) LIKE 'sl1%'
+""").to_pandas()
 
-TABLES="../input/tables_sl1.csv"
-COLS="../input/columns_sl1.psv"
+sf_tables = session.sql("""
+SELECT
+LOWER(table_schema) AS schema,
+LOWER(table_name) AS table
+FROM prod.information_schema.tables
+WHERE LOWER(table_schema) LIKE 'sl1%'
+""").to_pandas()
 
-OUT="../intermediate/tables_missing_columns.csv"
+sf_tables_filtered = sf_tables[
+    sf_tables['table'].str.endswith(('_h','_t2'))
+]
 
-cut -d',' -f1,2 $TABLES | tail -n +2 | sort > /tmp/all_tables.txt
-cut -d'|' -f1,2 $COLS | sort | uniq > /tmp/column_tables.txt
+cloudera_tables_filtered = tables[
+    tables['table'].str.endswith(('_h','_t2'))
+]
 
-comm -23 /tmp/all_tables.txt /tmp/column_tables.txt > $OUT
+missing_tables = cloudera_tables_filtered.merge(
+    sf_tables_filtered,
+    on=['schema','table'],
+    how='left',
+    indicator=True
+)
 
-echo "Missing column tables saved → $OUT"
+missing_tables = missing_tables[
+    missing_tables['_merge']=='left_only'
+][['schema','table']]
 
-scripts/extract_missing_columns.sh
-#!/bin/bash
+extra_tables = sf_tables_filtered.merge(
+    cloudera_tables_filtered,
+    on=['schema','table'],
+    how='left',
+    indicator=True
+)
 
-INPUT="../intermediate/tables_missing_columns.csv"
-OUT="../input/columns_sl1.psv"
+extra_tables = extra_tables[
+    extra_tables['_merge']=='left_only'
+][['schema','table']]
 
-tail -n +1 $INPUT | while IFS=',' read SCHEMA TABLE
-do
+****
+common_tables = cloudera_tables_filtered.merge(
+    sf_tables_filtered,
+    on=['schema','table']
+)
 
-impala-shell -k -i your-host -B -q "DESCRIBE ${SCHEMA}.${TABLE}" |
-awk -v s=$SCHEMA -v t=$TABLE '
-NF>=2 && $1!="#" {
-print s "|" t "|" $1 "|" $2
-}' >> $OUT
-
-echo "$SCHEMA.$TABLE extracted"
-
-done
-
-scripts/verify_all_columns.sh
-
-
-
-
-
-
-import pandas as pd
-
-schemas = pd.read_csv("schemas_sl1.csv")
-tables = pd.read_csv("tables_sl1.csv")
-
-cloudera_cols = pd.read_csv(
+cloudera_columns = pd.read_csv(
     "columns_sl1.psv",
     sep="|",
     names=["schema","table","column","datatype"]
 )
 
-for df in [schemas,tables,cloudera_cols]:
-    for c in df.columns:
-        if df[c].dtype=="object":
-            df[c] = df[c].str.lower()
+cloudera_columns['schema'] = cloudera_columns['schema'].str.lower()
+cloudera_columns['table'] = cloudera_columns['table'].str.lower()
+cloudera_columns['column'] = cloudera_columns['column'].str.lower()
 
+cloudera_cols_common = cloudera_columns.merge(common_tables)
 
+sf_cols_common = sf_columns.merge(common_tables)
 
-
-sf_schemas = session.sql("""
-select lower(schema_name) schema
-from prod.information_schema.schemata
-""").to_pandas()
-
-
-
-sf_schemas = sf_schemas[
-    sf_schemas['schema'].str.startswith("sl1")
-]
-
-sf_tables = session.sql("""
-select
-lower(table_schema) schema,
-lower(table_name) table
-from prod.information_schema.tables
-where lower(table_schema) like 'sl1%'
-""").to_pandas()
-
-sf_columns = session.sql("""
-select
-lower(table_schema) schema,
-lower(table_name) table,
-lower(column_name) column,
-lower(data_type) datatype
-from prod.information_schema.columns
-where lower(table_schema) like 'sl1%'
-""").to_pandas()
-
-cloudera_h = tables[tables.table.str.endswith('_h')]
-cloudera_t2 = tables[tables.table.str.endswith('_t2')]
-
-sf_h = sf_tables[sf_tables.table.str.endswith('_h')]
-sf_t2 = sf_tables[sf_tables.table.str.endswith('_t2')]
-
-
-missing_schemas = schemas.merge(
-    sf_schemas,
-    on="schema",
-    how="left",
+missing_columns = cloudera_cols_common.merge(
+    sf_cols_common,
+    on=['schema','table','column'],
+    how='left',
     indicator=True
 )
 
-missing_schemas = missing_schemas[
-missing_schemas["_merge"]=="left_only"
-]
-
-extra_schemas = sf_schemas.merge(
-schemas,
-on="schema",
-how="left",
-indicator=True
-)
-
-extra_schemas = extra_schemas[
-extra_schemas["_merge"]=="left_only"
-]
-
-missing_tables = tables.merge(
-sf_tables,
-on=["schema","table"],
-how="left",
-indicator=True
-)
-
-missing_tables = missing_tables[
-missing_tables["_merge"]=="left_only"
-]
-
-extra_tables = sf_tables.merge(
-tables,
-on=["schema","table"],
-how="left",
-indicator=True
-)
-
-extra_tables = extra_tables[
-extra_tables["_merge"]=="left_only"
-]
-
-common_tables = tables.merge(
-sf_tables,
-on=["schema","table"]
-)
-
-cloudera_common = cloudera_cols.merge(common_tables)
-sf_common = sf_columns.merge(common_tables)
-
-missing_columns = cloudera_common.merge(
-sf_common,
-on=["schema","table","column"],
-how="left",
-indicator=True
-)
-
 missing_columns = missing_columns[
-missing_columns["_merge"]=="left_only"
-]
+    missing_columns['_merge']=='left_only'
+][['schema','table','column']]
 
-extra_columns = sf_common.merge(
-cloudera_common,
-on=["schema","table","column"],
-how="left",
-indicator=True
+extra_columns = sf_cols_common.merge(
+    cloudera_cols_common,
+    on=['schema','table','column'],
+    how='left',
+    indicator=True
 )
 
 extra_columns = extra_columns[
-extra_columns["_merge"]=="left_only"
-]
-missing_schemas.to_csv("missing_schemas.csv",index=False)
-extra_schemas.to_csv("extra_schemas.csv",index=False)
+    extra_columns['_merge']=='left_only'
+][['schema','table','column']]
 
-missing_tables.to_csv("missing_tables.csv",index=False)
-extra_tables.to_csv("extra_tables.csv",index=False)
+datatype_compare = cloudera_cols_common.merge(
+    sf_cols_common,
+    on=['schema','table','column'],
+    suffixes=('_cloudera','_snowflake')
+)
 
-missing_columns.to_csv("missing_columns.csv",index=False)
-extra_columns.to_csv("extra_columns.csv",index=False)
+print("Missing tables:", len(missing_tables))
+print("Extra tables:", len(extra_tables))
+
+print("Missing columns:", len(missing_columns))
+print("Extra columns:", len(extra_columns))
