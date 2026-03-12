@@ -1,42 +1,94 @@
-common_schemas = schemas.merge(
-    sf_schemas,
-    on="schema",
-    how="inner"
+mapping = pd.read_csv("datatype_mapping.csv")
+
+mapping['hive_type'] = mapping['hive_type'].str.lower()
+mapping['snowflake_type'] = mapping['snowflake_type'].str.lower()
+
+import re
+
+def extract_base(dtype):
+    if pd.isna(dtype):
+        return None
+    return re.split(r'\(', dtype.lower())[0]
+
+cloudera_cols['base_type'] = cloudera_cols['datatype'].apply(extract_base)
+
+def extract_precision(dtype):
+    m = re.search(r'\((\d+),?(\d+)?\)', str(dtype))
+    if m:
+        precision = int(m.group(1))
+        scale = int(m.group(2)) if m.group(2) else None
+        return pd.Series([precision,scale])
+    return pd.Series([None,None])
+
+cloudera_cols[['precision','scale']] = cloudera_cols['datatype'].apply(extract_precision)
+
+def build_sf_type(row):
+
+    t = row['datatype']
+
+    if t == 'number':
+        if pd.notna(row['numeric_precision']):
+            return f"number({int(row['numeric_precision'])},{int(row['numeric_scale'])})"
+
+    if t in ['varchar','text']:
+        if pd.notna(row['character_maximum_length']):
+            return f"varchar({int(row['character_maximum_length'])})"
+
+    return t
+
+sf_columns['datatype_full'] = sf_columns.apply(build_sf_type,axis=1)
+
+sf_columns['base_type'] = sf_columns['datatype'].str.lower()
+
+cloudera_cols = cloudera_cols.merge(
+    mapping,
+    left_on='base_type',
+    right_on='hive_type',
+    how='left'
 )
-cloudera_tables_filtered = tables[
-    tables["schema"].isin(common_schemas["schema"])
-]
 
-sf_tables_filtered = sf_tables[
-    sf_tables["schema"].isin(common_schemas["schema"])
-]
+cloudera_cols.rename(columns={
+    'snowflake_type':'expected_sf_type'
+}, inplace=True)
 
-cloudera_tables_filtered = cloudera_tables_filtered[
-    cloudera_tables_filtered["table"].str.endswith(("_h","_t2"))
-]
-
-sf_tables_filtered = sf_tables_filtered[
-    sf_tables_filtered["table"].str.endswith(("_h","_t2"))
-]
-
-missing_tables = cloudera_tables_filtered.merge(
-    sf_tables_filtered,
-    on=["schema","table"],
-    how="left",
-    indicator=True
+datatype_compare = cloudera_cols.merge(
+    sf_columns,
+    on=['schema','table','column'],
+    suffixes=('_hive','_snowflake')
+)
+datatype_compare['datatype_match'] = (
+    datatype_compare['expected_sf_type'] ==
+    datatype_compare['base_type_snowflake']
 )
 
-missing_tables = missing_tables[
-    missing_tables["_merge"]=="left_only"
-][["schema","table"]]
+def build_hive_type(row):
 
-extra_tables = sf_tables_filtered.merge(
-    cloudera_tables_filtered,
-    on=["schema","table"],
-    how="left",
-    indicator=True
+    base = row['expected_sf_type']
+
+    if base == 'number' and pd.notna(row['precision']):
+        return f"number({int(row['precision'])},{int(row['scale'])})"
+
+    return base
+
+datatype_compare['expected_full_type'] = datatype_compare.apply(
+    build_hive_type,axis=1
 )
+def classify(row):
 
-extra_tables = extra_tables[
-    extra_tables["_merge"]=="left_only"
-][["schema","table"]]
+    if not row['datatype_match']:
+        return "DATATYPE_MISMATCH"
+
+    if not row['precision_match']:
+        return "PRECISION_MISMATCH"
+
+    return "MATCH"
+
+datatype_compare['validation_result'] = datatype_compare.apply(classify,axis=1)
+
+datatype_compare[
+    datatype_compare['validation_result']=="DATATYPE_MISMATCH"
+]
+datatype_compare[
+    datatype_compare['validation_result']=="PRECISION_MISMATCH"
+]
+datatype_compare['validation_result'].value_counts()
