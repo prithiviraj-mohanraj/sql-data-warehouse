@@ -1,44 +1,98 @@
-import re
+kafka_tables = sf_columns[
+    sf_columns['column'] == 'kafka_process_dt'
+][['schema','table']].drop_duplicates()
 
-def hive_base_type(dtype):
+kafka_tables['date_column'] = 'kafka_process_dt'
 
-    if pd.isna(dtype):
-        return None
+ods_tables = sf_columns[
+    sf_columns['column'] == 'ods_business_day'
+][['schema','table']].drop_duplicates()
 
-    return re.split(r'\(', str(dtype).lower())[0]
+ods_tables['date_column'] = 'ods_business_day'
 
-cloudera_cols['base_type'] = cloudera_cols['datatype'].apply(hive_base_type)
-
-sf_columns['base_type'] = sf_columns['datatype'].str.lower()
-
-mapping = pd.read_csv("datatype_mapping.csv")
-
-mapping['hive_type'] = mapping['hive_type'].str.lower()
-mapping['snowflake_type'] = mapping['snowflake_type'].str.lower()
-
-cloudera_cols = cloudera_cols.merge(
-    mapping,
-    left_on='base_type',
-    right_on='hive_type',
-    how='left'
+ods_tables = ods_tables.merge(
+    kafka_tables[['schema','table']],
+    on=['schema','table'],
+    how='left',
+    indicator=True
 )
 
-cloudera_cols.rename(
-    columns={'snowflake_type':'expected_sf_type'},
-    inplace=True
-)
-datatype_compare = cloudera_cols.merge(
-    sf_columns,
-    on=['schema','table','column'],
-    suffixes=('_hive','_snowflake')
-)
-datatype_compare['datatype_match'] = (
-    datatype_compare['expected_sf_type'] ==
-    datatype_compare['base_type_snowflake']
+ods_tables = ods_tables[
+    ods_tables['_merge']=='left_only'
+][['schema','table','date_column']]
+
+
+valid_tables = pd.concat([kafka_tables, ods_tables])
+all_tables = sf_columns[['schema','table']].drop_duplicates()
+
+excluded_tables = all_tables.merge(
+    valid_tables[['schema','table']],
+    on=['schema','table'],
+    how='left',
+    indicator=True
 )
 
-datatype_mismatch = datatype_compare[
-    datatype_compare['datatype_match'] == False
-][['schema','table','column','base_type_hive','base_type_snowflake']]
+excluded_tables = excluded_tables[
+    excluded_tables['_merge']=='left_only'
+][['schema','table']]
 
-datatype_compare['datatype_match'].value_counts()
+min_results = []
+
+for _,row in valid_tables.iterrows():
+
+    schema = row['schema']
+    table = row['table']
+    col = row['date_column']
+
+    query = f"""
+    SELECT
+    '{schema}' AS schema,
+    '{table}' AS table,
+    '{col}' AS date_column,
+    MIN({col}) AS min_date
+    FROM prod.{schema}.{table}
+    """
+
+    try:
+        df = session.sql(query).to_pandas()
+        min_results.append(df.iloc[0].to_dict())
+
+        print(f"{schema}.{table} min done")
+
+    except:
+        print(f"{schema}.{table} failed")
+
+min_df = pd.DataFrame(min_results)
+
+min_df = min_df[min_df['min_date'].notna()]
+null_min_tables = min_df[min_df['min_date'].isna()]
+
+count_results = []
+
+for _,row in min_df.iterrows():
+
+    schema = row['schema']
+    table = row['table']
+    col = row['date_column']
+    date = row['min_date']
+
+    query = f"""
+    SELECT
+    '{schema}' AS schema,
+    '{table}' AS table,
+    '{col}' AS date_column,
+    '{date}' AS min_date,
+    COUNT(*) AS record_count
+    FROM prod.{schema}.{table}
+    WHERE {col} = '{date}'
+    """
+
+    try:
+        df = session.sql(query).to_pandas()
+        count_results.append(df.iloc[0].to_dict())
+
+        print(f"{schema}.{table} count done")
+
+    except:
+        print(f"{schema}.{table} failed")
+
