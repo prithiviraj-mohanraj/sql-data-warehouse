@@ -1,61 +1,61 @@
-min_results = []
+import pandas as pd
 
-for _,row in valid_tables.iterrows():
-
-    schema = row['schema']
-    table = row['table']
-    col = row['date_column']
-
-    query = f"""
-    SELECT
-    '{schema}' AS schema,
-    '{table}' AS table,
-    '{col}' AS date_column,
-    MIN({col}) AS min_date
-    FROM prod.{schema}.{table}
-    GROUP BY 1
-    """
-
-    try:
-        df = session.sql(query).to_pandas()
-
-        if not df.empty:
-            min_results.append(df.to_dict(orient='records')[0])
-
-        print(f"{schema}.{table} done")
-
-    except:
-        print(f"{schema}.{table} failed")
+cloudera_df = pd.read_csv("cloudera_min_date_counts.csv")
+snowflake_df = pd.read_csv("snowflake_min_date_counts.csv")
 
 
-count_results = []
+for df in [cloudera_df, snowflake_df]:
+    df['schema'] = df['schema'].str.lower()
+    df['table'] = df['table'].str.lower()
+    df['date_column'] = df['date_column'].str.lower()
 
-for _,row in min_df.iterrows():
+cloudera_df = cloudera_df.rename(columns={
+    "min_date": "min_date_cloudera",
+    "record_count": "count_cloudera"
+})
 
-    schema = row['schema']
-    table = row['table']
-    col = row['date_column']
-    date = row['min_date']
+snowflake_df = snowflake_df.rename(columns={
+    "min_date": "min_date_snowflake",
+    "record_count": "count_snowflake"
+})
 
-    query = f"""
-    SELECT
-    '{schema}' AS schema,
-    '{table}' AS table,
-    '{col}' AS date_column,
-    '{date}' AS min_date,
-    COUNT(*) AS record_count
-    FROM prod.{schema}.{table}
-    WHERE {col} = '{date}'
-    GROUP BY 1
-    """
+compare_df = cloudera_df.merge(
+    snowflake_df,
+    on=['schema','table','date_column'],
+    how='outer'
+)
 
-    try:
-        df = session.sql(query).to_pandas()
+compare_df['date_match'] = (
+    compare_df['min_date_cloudera'] ==
+    compare_df['min_date_snowflake']
+)
 
-        if not df.empty:
-            count_results.append(df.to_dict(orient='records')[0])
+compare_df['count_match'] = (
+    compare_df['count_cloudera'] ==
+    compare_df['count_snowflake']
+)
 
-        print(f"{schema}.{table} done")
+def final_status(row):
 
-    except:
-        print(f"{schema}.{table} failed")
+    if pd.isna(row['min_date_snowflake']):
+        return "MISSING_IN_SNOWFLAKE"
+
+    if pd.isna(row['min_date_cloudera']):
+        return "EXTRA_IN_SNOWFLAKE"
+
+    if not row['date_match']:
+        return "MIN_DATE_MISMATCH"
+
+    if not row['count_match']:
+        return "COUNT_MISMATCH"
+
+    return "MATCH"
+
+
+compare_df['status'] = compare_df.apply(final_status, axis=1)
+
+
+mismatch_df = compare_df[
+    compare_df['status'] != "MATCH"
+]
+compare_df['status'].value_counts()
