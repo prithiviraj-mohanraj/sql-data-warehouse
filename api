@@ -1,61 +1,103 @@
-import pandas as pd
+scripts/cloudera_max_date_count_parallel.py
 
-cloudera_df = pd.read_csv("cloudera_min_date_counts.csv")
-snowflake_df = pd.read_csv("snowflake_min_date_counts.csv")
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+INPUT_FILE = "../input/input_sf_max_date.csv"
+OUTPUT_FILE = "../output/cloudera_max_date_counts.csv"
+
+IMPALA_HOST = "your-host"
+
+MAX_THREADS = 10   # safe value (adjust 5–15 max)
+
+# ------------------------------------------
+# Read input
+# ------------------------------------------
+rows = []
+
+with open(INPUT_FILE) as f:
+    next(f)  # skip header
+    for line in f:
+        parts = line.strip().split(",")
+
+        if len(parts) < 4:
+            continue
+
+        schema, table, col, date = parts[:4]
+
+        rows.append({
+            "schema": schema,
+            "table": table,
+            "col": col,
+            "date": date
+        })
+
+# ------------------------------------------
+# Query function
+# ------------------------------------------
+def run_query(idx, row):
+
+    schema = row["schema"]
+    table = row["table"]
+    col = row["col"]
+    date = row["date"]
+
+    query = f"""
+    SELECT COUNT(*)
+    FROM {schema}.{table}
+    WHERE {col}='{date}'
+    """
+
+    cmd = [
+        "impala-shell",
+        "-k",
+        "-i", IMPALA_HOST,
+        "-B",
+        "-q", query
+    ]
+
+    try:
+        result = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+        count = result.decode().strip().split("\n")[-1]
+
+    except:
+        count = "ERROR"
+
+    print(f"{schema}.{table} done")
+
+    return idx, schema, table, col, date, count
 
 
-for df in [cloudera_df, snowflake_df]:
-    df['schema'] = df['schema'].str.lower()
-    df['table'] = df['table'].str.lower()
-    df['date_column'] = df['date_column'].str.lower()
+# ------------------------------------------
+# Run parallel
+# ------------------------------------------
+results = [None] * len(rows)
 
-cloudera_df = cloudera_df.rename(columns={
-    "min_date": "min_date_cloudera",
-    "record_count": "count_cloudera"
-})
+with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
 
-snowflake_df = snowflake_df.rename(columns={
-    "min_date": "min_date_snowflake",
-    "record_count": "count_snowflake"
-})
+    futures = {
+        executor.submit(run_query, idx, row): idx
+        for idx, row in enumerate(rows)
+    }
 
-compare_df = cloudera_df.merge(
-    snowflake_df,
-    on=['schema','table','date_column'],
-    how='outer'
-)
-
-compare_df['date_match'] = (
-    compare_df['min_date_cloudera'] ==
-    compare_df['min_date_snowflake']
-)
-
-compare_df['count_match'] = (
-    compare_df['count_cloudera'] ==
-    compare_df['count_snowflake']
-)
-
-def final_status(row):
-
-    if pd.isna(row['min_date_snowflake']):
-        return "MISSING_IN_SNOWFLAKE"
-
-    if pd.isna(row['min_date_cloudera']):
-        return "EXTRA_IN_SNOWFLAKE"
-
-    if not row['date_match']:
-        return "MIN_DATE_MISMATCH"
-
-    if not row['count_match']:
-        return "COUNT_MISMATCH"
-
-    return "MATCH"
+    for future in as_completed(futures):
+        idx, schema, table, col, date, count = future.result()
+        results[idx] = (schema, table, col, date, count)
 
 
-compare_df['status'] = compare_df.apply(final_status, axis=1)
+# ------------------------------------------
+# Write output in SAME ORDER
+# ------------------------------------------
+with open(OUTPUT_FILE, "w") as f:
 
+    f.write("schema,table,date_column,date,count\n")
 
-mismatch_df = compare_df[
-    compare_df['status'] != "MATCH"
-]
-compare_df['status'].value_counts()
+    for r in results:
+        if r:
+            f.write(",".join(r) + "\n")
+
+print("Completed →", OUTPUT_FILE)
+
+nohup python scripts/cloudera_max_date_count_parallel.py > logs/max_date_counts.log 2>&1 &
+
+tail -f logs/max_date_counts.log
