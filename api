@@ -1,121 +1,54 @@
-scripts/cloudera_min_date_count_parallel.py
-import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-INPUT_FILE = "../input/tables_with_date_column.csv"
-OUTPUT_FILE = "../output/cloudera_min_date_counts.csv"
-EXCLUDED_FILE = "../output/cloudera_excluded_tables.csv"
-
-IMPALA_HOST = "your-host"
-MAX_THREADS = 10
-
-rows = []
-excluded = []
-
-# ------------------------------------------
-# Read input
-# ------------------------------------------
-with open(INPUT_FILE) as f:
-    next(f)
-    for line in f:
-        parts = line.strip().split(",")
-
-        if len(parts) < 3:
-            continue
-
-        schema, table, col = parts[:3]
-
-        if col == "" or col.lower() == "null":
-            excluded.append((schema, table))
-            continue
-
-        rows.append({
-            "schema": schema,
-            "table": table,
-            "col": col
-        })
-
-# ------------------------------------------
-# Query function
-# ------------------------------------------
-def run_query(idx, row):
-
-    schema = row["schema"]
-    table = row["table"]
-    col = row["col"]
-
-    query = f"""
-    SELECT MIN({col}), COUNT(*) 
-    FROM {schema}.{table}
-    WHERE {col} IS NOT NULL
-    """
-
-    cmd = [
-        "impala-shell",
-        "-k",
-        "-i", IMPALA_HOST,
-        "-B",
-        "-q", query
-    ]
-
-    try:
-        result = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-        lines = result.decode().strip().split("\n")
-
-        if len(lines) >= 1:
-            values = lines[-1].split("\t")
-
-            min_date = values[0]
-            count = values[1]
-        else:
-            min_date = "NULL"
-            count = "0"
-
-    except:
-        min_date = "ERROR"
-        count = "ERROR"
-
-    print(f"{schema}.{table} done")
-
-    return idx, schema, table, col, min_date, count
-
-
-# ------------------------------------------
-# Run parallel
-# ------------------------------------------
-results = [None] * len(rows)
-
-with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-
-    futures = {
-        executor.submit(run_query, idx, row): idx
-        for idx, row in enumerate(rows)
-    }
-
-    for future in as_completed(futures):
-        idx, schema, table, col, min_date, count = future.result()
-        results[idx] = (schema, table, col, min_date, count)
-
-# ------------------------------------------
-# Write output
-# ------------------------------------------
-with open(OUTPUT_FILE, "w") as f:
-
-    f.write("schema,table,date_column,min_date,count\n")
-
-    for r in results:
-        if r:
-            f.write(",".join(r) + "\n")
-
-# ------------------------------------------
-# Write excluded tables
-# ------------------------------------------
-with open(EXCLUDED_FILE, "w") as f:
-
-    f.write("schema,table\n")
-
-    for r in excluded:
-        f.write(",".join(r) + "\n")
-
-print("Completed →", OUTPUT_FILE)
-
+Demo Explanation (Spoken Format)
+“I worked on validating data consistency between Cloudera and Snowflake after migration.”
+🧩 What exactly I validated
+“For each table, I validated minimum business date and corresponding record count between both systems.”
+For streaming tables → I used kafka_process_dt
+For batch tables → I used ods_business_day
+“This ensures we are comparing the earliest available data consistently across both platforms.”
+⚙️ How I implemented in Cloudera
+“I used an Impala session via shell to run queries on all tables.”
+Instead of running one-by-one manually,
+I built a Python script with threading
+👉 Each thread:
+picks one table
+runs query:
+MIN(date_column)
+COUNT(*) for that date
+“This allowed parallel execution across thousands of tables while still controlling load on the cluster.”
+🚀 Why threading was needed
+“We had around thousands of tables, so sequential execution would take hours.”
+With threading:
+Reduced runtime significantly
+Maintained order of output
+Used controlled concurrency (10 threads) to avoid production impact
+⚠️ Challenges faced
+“I encountered a few practical challenges during implementation:”
+Different date columns
+Streaming vs batch tables had different date logic
+Solved by dynamically selecting column per table
+Tables without date columns
+Some tables had neither kafka_process_dt nor ods_business_day
+These were excluded and tracked separately for audit
+Null values in date column
+Caused query failures initially
+Fixed by filtering IS NOT NULL
+Snowflake vs Cloudera differences
+Snowflake data slightly lagging due to migration
+So I compared using Snowflake’s max date also in a separate validation
+Performance
+Running thousands of queries
+Solved using threading + nohup execution
+📊 Results produced
+“I generated structured output files for both systems:”
+schema, table, date_column, min_date, count
+Then:
+Compared Cloudera vs Snowflake
+Classified results into:
+✅ Match
+⚠️ Count mismatch
+⚠️ Date mismatch
+✅ Key outcome
+“This validation ensures:”
+Data is consistent at boundary level (earliest records)
+Migration completeness is measurable
+Any gaps are clearly identified at table level
