@@ -1,32 +1,4 @@
-#!/bin/bash
-
-INPUT_FILE="input_tables.csv"
-OUTPUT_FILE="cloudera_min_date_counts.csv"
-
-IMPALA_HOST="your-host"
-
-# header
-echo "schema,table,date_column,min_date,count" > $OUTPUT_FILE
-
-tail -n +2 $INPUT_FILE | while IFS=',' read SCHEMA TABLE COL
-do
-
-# construct query (your format)
-QUERY="SELECT '${SCHEMA}','${TABLE}','${COL}', MIN(${COL}), COUNT(${COL})
-FROM ${SCHEMA}.${TABLE}
-WHERE ${COL} IS NOT NULL;"
-
-# run using your same command style
-RESULT=$(term ansi impala-shell -k -i $IMPALA_HOST -B -q "$QUERY" 2>/dev/null)
-
-# get last line (actual result)
-LINE=$(echo "$RESULT" | tail -n 1)
-
-# append as CSV
-echo "$LINE" | awk -F'\t' '{print $1","$2","$3","$4","$5}' >> $OUTPUT_FILE
-
-echo "$SCHEMA.$TABLE done"
-
-done
-
-echo "Completed → $OUTPUT_FILE"
+QUERY="SELECT MIN(${COL}), COUNT(*) FROM ${SCHEMA}.${TABLE} 
+WHERE ${COL} = (
+    SELECT MIN(${COL}) FROM ${SCHEMA}.${TABLE} WHERE ${COL} IS NOT NULL
+);"
