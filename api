@@ -1,54 +1,32 @@
-Demo Explanation (Spoken Format)
-“I worked on validating data consistency between Cloudera and Snowflake after migration.”
-🧩 What exactly I validated
-“For each table, I validated minimum business date and corresponding record count between both systems.”
-For streaming tables → I used kafka_process_dt
-For batch tables → I used ods_business_day
-“This ensures we are comparing the earliest available data consistently across both platforms.”
-⚙️ How I implemented in Cloudera
-“I used an Impala session via shell to run queries on all tables.”
-Instead of running one-by-one manually,
-I built a Python script with threading
-👉 Each thread:
-picks one table
-runs query:
-MIN(date_column)
-COUNT(*) for that date
-“This allowed parallel execution across thousands of tables while still controlling load on the cluster.”
-🚀 Why threading was needed
-“We had around thousands of tables, so sequential execution would take hours.”
-With threading:
-Reduced runtime significantly
-Maintained order of output
-Used controlled concurrency (10 threads) to avoid production impact
-⚠️ Challenges faced
-“I encountered a few practical challenges during implementation:”
-Different date columns
-Streaming vs batch tables had different date logic
-Solved by dynamically selecting column per table
-Tables without date columns
-Some tables had neither kafka_process_dt nor ods_business_day
-These were excluded and tracked separately for audit
-Null values in date column
-Caused query failures initially
-Fixed by filtering IS NOT NULL
-Snowflake vs Cloudera differences
-Snowflake data slightly lagging due to migration
-So I compared using Snowflake’s max date also in a separate validation
-Performance
-Running thousands of queries
-Solved using threading + nohup execution
-📊 Results produced
-“I generated structured output files for both systems:”
-schema, table, date_column, min_date, count
-Then:
-Compared Cloudera vs Snowflake
-Classified results into:
-✅ Match
-⚠️ Count mismatch
-⚠️ Date mismatch
-✅ Key outcome
-“This validation ensures:”
-Data is consistent at boundary level (earliest records)
-Migration completeness is measurable
-Any gaps are clearly identified at table level
+#!/bin/bash
+
+INPUT_FILE="input_tables.csv"
+OUTPUT_FILE="cloudera_min_date_counts.csv"
+
+IMPALA_HOST="your-host"
+
+# header
+echo "schema,table,date_column,min_date,count" > $OUTPUT_FILE
+
+tail -n +2 $INPUT_FILE | while IFS=',' read SCHEMA TABLE COL
+do
+
+# construct query (your format)
+QUERY="SELECT '${SCHEMA}','${TABLE}','${COL}', MIN(${COL}), COUNT(${COL})
+FROM ${SCHEMA}.${TABLE}
+WHERE ${COL} IS NOT NULL;"
+
+# run using your same command style
+RESULT=$(term ansi impala-shell -k -i $IMPALA_HOST -B -q "$QUERY" 2>/dev/null)
+
+# get last line (actual result)
+LINE=$(echo "$RESULT" | tail -n 1)
+
+# append as CSV
+echo "$LINE" | awk -F'\t' '{print $1","$2","$3","$4","$5}' >> $OUTPUT_FILE
+
+echo "$SCHEMA.$TABLE done"
+
+done
+
+echo "Completed → $OUTPUT_FILE"
