@@ -2,3 +2,14 @@ QUERY="SELECT MIN(${COL}), COUNT(*) FROM ${SCHEMA}.${TABLE}
 WHERE ${COL} = (
     SELECT MIN(${COL}) FROM ${SCHEMA}.${TABLE} WHERE ${COL} IS NOT NULL
 );"
+
+
+We are currently working on validation between Cloudera and Snowflake. For most tables data is matching, but we are seeing a few mismatches that we want to clarify.
+In some tables, Snowflake record count is exactly double compared to Cloudera — for example, if Cloudera has around 150K records, Snowflake has around 300K. This looks like duplicate data ingestion on the Snowflake side.
+Also, for some tables, Snowflake minimum date is greater than Cloudera, which indicates some data might be missing in Snowflake.
+But in a few tables, we are seeing the reverse — Snowflake has an older minimum date than Cloudera. We wanted to check if this is expected due to any retention or data cleanup in Cloudera, or if Snowflake might have been loaded from a different or historical source.
+Could you please help confirm which of these scenarios applies here? is
+
+Many Cloudera tables have retention like:
+keep last 2 years
+drop old partitions
