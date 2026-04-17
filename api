@@ -1,15 +1,51 @@
-QUERY="SELECT MIN(${COL}), COUNT(*) FROM ${SCHEMA}.${TABLE} 
-WHERE ${COL} = (
-    SELECT MIN(${COL}) FROM ${SCHEMA}.${TABLE} WHERE ${COL} IS NOT NULL
-);"
+#!/bin/bash
+
+INPUT_FILE="input_min_dates.csv"
+OUTPUT_FILE="cloudera_min_date_counts.csv"
+FAILED_FILE="failed_tables.csv"
+
+IMPALA_HOST="your-host"
+
+# headers
+echo "schema,table,column,mindate,count" > $OUTPUT_FILE
+echo "schema,table,column,mindate" > $FAILED_FILE
+
+tail -n +2 $INPUT_FILE | while IFS=',' read SCHEMA TABLE COL DATE
+do
+
+# skip empty
+if [[ -z "$SCHEMA" || -z "$TABLE" || -z "$COL" || -z "$DATE" ]]; then
+    echo "$SCHEMA,$TABLE,$COL,$DATE" >> $FAILED_FILE
+    continue
+fi
+
+QUERY="SELECT COUNT(${COL}) FROM ${SCHEMA}.${TABLE} WHERE ${COL}='${DATE}';"
+
+RESULT=$(impala-shell -k -i $IMPALA_HOST -B -q "$QUERY" 2>/dev/null)
+
+# get last line (actual result)
+COUNT=$(echo "$RESULT" | tail -n 1)
+
+# check error or empty
+if [[ -z "$COUNT" || "$COUNT" == *"ERROR"* ]]; then
+    echo "$SCHEMA,$TABLE,$COL,$DATE" >> $FAILED_FILE
+    echo "$SCHEMA.$TABLE failed"
+else
+    echo "$SCHEMA,$TABLE,$COL,$DATE,$COUNT" >> $OUTPUT_FILE
+    echo "$SCHEMA.$TABLE done"
+fi
+
+done
+
+echo "Completed → $OUTPUT_FILE"
+echo "Failed tables → $FAILED_FILE"
 
 
-We are currently working on validation between Cloudera and Snowflake. For most tables data is matching, but we are seeing a few mismatches that we want to clarify.
-In some tables, Snowflake record count is exactly double compared to Cloudera — for example, if Cloudera has around 150K records, Snowflake has around 300K. This looks like duplicate data ingestion on the Snowflake side.
-Also, for some tables, Snowflake minimum date is greater than Cloudera, which indicates some data might be missing in Snowflake.
-But in a few tables, we are seeing the reverse — Snowflake has an older minimum date than Cloudera. We wanted to check if this is expected due to any retention or data cleanup in Cloudera, or if Snowflake might have been loaded from a different or historical source.
-Could you please help confirm which of these scenarios applies here? is
 
-Many Cloudera tables have retention like:
-keep last 2 years
-drop old partitions
+cloudera_min_date_count_retry.sh
+
+
+
+nohup bash cloudera_min_date_count_retry.sh > logs/min_count_retry.log 2>&1 &
+
+tail -f logs/min_count_retry.log
