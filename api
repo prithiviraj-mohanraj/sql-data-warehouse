@@ -1,51 +1,102 @@
+cloudera_range_count.sh
 #!/bin/bash
 
-INPUT_FILE="input_min_dates.csv"
-OUTPUT_FILE="cloudera_min_date_counts.csv"
-FAILED_FILE="failed_tables.csv"
+INPUT_FILE="input_min_max.csv"
+OUTPUT_FILE="cloudera_range_counts.csv"
 
 IMPALA_HOST="your-host"
 
-# headers
-echo "schema,table,column,mindate,count" > $OUTPUT_FILE
-echo "schema,table,column,mindate" > $FAILED_FILE
+# header
+echo "schema,table,date_column,min_date,max_date,count" > $OUTPUT_FILE
 
-tail -n +2 $INPUT_FILE | while IFS=',' read SCHEMA TABLE COL DATE
+tail -n +2 $INPUT_FILE | while IFS=',' read SCHEMA TABLE COL MIN_DATE MAX_DATE
 do
 
-# skip empty
-if [[ -z "$SCHEMA" || -z "$TABLE" || -z "$COL" || -z "$DATE" ]]; then
-    echo "$SCHEMA,$TABLE,$COL,$DATE" >> $FAILED_FILE
+# skip invalid
+if [[ -z "$COL" || -z "$MIN_DATE" || -z "$MAX_DATE" ]]; then
+    echo "$SCHEMA,$TABLE,$COL,$MIN_DATE,$MAX_DATE,NULL" >> $OUTPUT_FILE
     continue
 fi
 
-QUERY="SELECT COUNT(${COL}) FROM ${SCHEMA}.${TABLE} WHERE ${COL}='${DATE}';"
+QUERY="SELECT COUNT(${COL}) 
+FROM ${SCHEMA}.${TABLE} 
+WHERE ${COL} BETWEEN '${MIN_DATE}' AND '${MAX_DATE}';"
 
-RESULT=$(impala-shell -k -i $IMPALA_HOST -B -q "$QUERY" 2>/dev/null)
+RESULT=$(impala-shell -k -i $IMPALA_HOST -B -q "$QUERY" 2>/dev/null | tail -n 1)
 
-# get last line (actual result)
-COUNT=$(echo "$RESULT" | tail -n 1)
+COUNT=$(echo $RESULT | tr -d '\r')
 
-# check error or empty
-if [[ -z "$COUNT" || "$COUNT" == *"ERROR"* ]]; then
-    echo "$SCHEMA,$TABLE,$COL,$DATE" >> $FAILED_FILE
-    echo "$SCHEMA.$TABLE failed"
-else
-    echo "$SCHEMA,$TABLE,$COL,$DATE,$COUNT" >> $OUTPUT_FILE
-    echo "$SCHEMA.$TABLE done"
-fi
+echo "$SCHEMA,$TABLE,$COL,$MIN_DATE,$MAX_DATE,$COUNT" >> $OUTPUT_FILE
+
+echo "$SCHEMA.$TABLE done"
 
 done
 
 echo "Completed → $OUTPUT_FILE"
-echo "Failed tables → $FAILED_FILE"
+nohup bash cloudera_range_count.sh > logs/range_count.log 2>&1 &
 
 
+import pandas as pd
 
-cloudera_min_date_count_retry.sh
+df = pd.read_csv("sf_min_max_dates.csv")
+
+df['schema'] = df['schema'].str.lower()
+df['table'] = df['table'].str.lower()
+df['date_column'] = df['date_column'].str.lower()
 
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-nohup bash cloudera_min_date_count_retry.sh > logs/min_count_retry.log 2>&1 &
+MAX_THREADS = 8
 
-tail -f logs/min_count_retry.log
+results = []
+def run_query(row):
+
+    schema = row['schema']
+    table = row['table']
+    col = row['date_column']
+    min_date = row['min_date']
+    max_date = row['max_date']
+
+    query = f"""
+    SELECT
+    '{schema}' AS schema,
+    '{table}' AS table,
+    '{col}' AS date_column,
+    '{min_date}' AS min_date,
+    '{max_date}' AS max_date,
+    COUNT({col}) AS record_count
+    FROM prod.{schema}.{table}
+    WHERE {col} BETWEEN '{min_date}' AND '{max_date}'
+    """
+
+    try:
+        df = session.sql(query).to_pandas()
+        res = df.to_dict(orient='records')[0]
+
+        print(f"{schema}.{table} done")
+
+        return res
+
+    except Exception as e:
+        print(f"{schema}.{table} failed")
+        return {
+            "schema":schema,
+            "table":table,
+            "date_column":col,
+            "min_date":min_date,
+            "max_date":max_date,
+            "record_count":"ERROR"
+        }
+
+with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+
+    futures = [executor.submit(run_query, row) for _,row in df.iterrows()]
+
+    for future in as_completed(futures):
+        results.append(future.result())
+
+
+final_df = pd.DataFrame(results)
+
+final_df.head()
