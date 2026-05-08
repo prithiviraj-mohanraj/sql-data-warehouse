@@ -1,102 +1,181 @@
-cloudera_range_count.sh
+validation_framework/
+│
+├── input/
+│   ├── tables.csv
+│   ├── primary_keys.csv
+│
+├── generated_sql/
+│
+├── output/
+│
+├── scripts/
+│   ├── 01_extract_columns.sh
+│   ├── 02_generate_validation_sql.py
+│   ├── 03_run_validation.sh
+│   ├── 04_compare_results.py
+│
+└── logs/
+tables.csv
+schema,table
+sl1_sales,orders_h
+sl1_stream,events_t2
+
+primary_keys.csv
+schema,table,pk_column
+sl1_sales,orders_h,order_id
+sl1_stream,events_t2,event_id
+
+
+01_extract_columns.sh
 #!/bin/bash
 
-INPUT_FILE="input_min_max.csv"
-OUTPUT_FILE="cloudera_range_counts.csv"
+INPUT="../input/tables.csv"
+OUT="../output/table_columns.psv"
 
-IMPALA_HOST="your-host"
+> $OUT
 
-# header
-echo "schema,table,date_column,min_date,max_date,count" > $OUTPUT_FILE
-
-tail -n +2 $INPUT_FILE | while IFS=',' read SCHEMA TABLE COL MIN_DATE MAX_DATE
+tail -n +2 $INPUT | while IFS=',' read SCHEMA TABLE
 do
 
-# skip invalid
-if [[ -z "$COL" || -z "$MIN_DATE" || -z "$MAX_DATE" ]]; then
-    echo "$SCHEMA,$TABLE,$COL,$MIN_DATE,$MAX_DATE,NULL" >> $OUTPUT_FILE
-    continue
-fi
+impala-shell -k -i your-host -B -q "
+DESCRIBE ${SCHEMA}.${TABLE}
+" 2>/dev/null |
+awk -v s=$SCHEMA -v t=$TABLE '
+NF>=2 && $1!="#" {
+print s "|" t "|" $1 "|" $2
+}' >> $OUT
 
-QUERY="SELECT COUNT(${COL}) 
-FROM ${SCHEMA}.${TABLE} 
-WHERE ${COL} BETWEEN '${MIN_DATE}' AND '${MAX_DATE}';"
-
-RESULT=$(impala-shell -k -i $IMPALA_HOST -B -q "$QUERY" 2>/dev/null | tail -n 1)
-
-COUNT=$(echo $RESULT | tr -d '\r')
-
-echo "$SCHEMA,$TABLE,$COL,$MIN_DATE,$MAX_DATE,$COUNT" >> $OUTPUT_FILE
-
-echo "$SCHEMA.$TABLE done"
+echo "$SCHEMA.$TABLE extracted"
 
 done
 
-echo "Completed → $OUTPUT_FILE"
-nohup bash cloudera_range_count.sh > logs/range_count.log 2>&1 &
+02_generate_validation_sql.py
+import csv
+
+INPUT_COLUMNS = "../output/table_columns.psv"
+INPUT_PK = "../input/primary_keys.csv"
+
+SQL_OUT = "../generated_sql/validation_queries.sql"
+
+numeric_types = [
+    'int','bigint','smallint',
+    'double','float','decimal'
+]
+
+tables = {}
+
+# -----------------------------------------
+# Read columns
+# -----------------------------------------
+with open(INPUT_COLUMNS) as f:
+
+    reader = csv.reader(f, delimiter='|')
+
+    for row in reader:
+
+        schema, table, col, dtype = row
+
+        key = (schema, table)
+
+        if key not in tables:
+            tables[key] = {
+                "numeric": [],
+                "columns": []
+            }
+
+        tables[key]["columns"].append(col)
+
+        dtype_lower = dtype.lower()
+
+        if any(x in dtype_lower for x in numeric_types):
+            tables[key]["numeric"].append(col)
+
+# -----------------------------------------
+# Read PKs
+# -----------------------------------------
+pk_map = {}
+
+with open(INPUT_PK) as f:
+
+    next(f)
+
+    for line in f:
+
+        schema, table, pk = line.strip().split(",")
+
+        pk_map[(schema, table)] = pk
+
+# -----------------------------------------
+# Generate SQL
+# -----------------------------------------
+with open(SQL_OUT, "w") as out:
+
+    for key, meta in tables.items():
+
+        schema, table = key
+
+        numeric_cols = meta["numeric"]
+
+        pk = pk_map.get((schema, table))
+
+        select_parts = []
+
+        # total count
+        select_parts.append(f"COUNT(*) AS total_count")
+
+        # min max business date
+        if "kafka_process_dt" in meta["columns"]:
+            dt_col = "kafka_process_dt"
+        else:
+            dt_col = "ods_business_day"
+
+        select_parts.append(f"MIN({dt_col}) AS min_date")
+        select_parts.append(f"MAX({dt_col}) AS max_date")
+
+        # numeric validations
+        for c in numeric_cols:
+
+            select_parts.append(f"SUM({c}) AS sum_{c}")
+            select_parts.append(f"AVG({c}) AS avg_{c}")
+            select_parts.append(f"MIN({c}) AS min_{c}")
+            select_parts.append(f"MAX({c}) AS max_{c}")
+
+        query = f"""
+SELECT
+'{schema}' AS schema_name,
+'{table}' AS table_name,
+{",".join(select_parts)}
+FROM {schema}.{table};
+"""
+
+        out.write(query + "\n")
+
+        # duplicate check
+        if pk:
+
+            dup_query = f"""
+SELECT
+'{schema}' AS schema_name,
+'{table}' AS table_name,
+COUNT(*) AS duplicate_count
+FROM (
+SELECT {pk}, COUNT(*)
+FROM {schema}.{table}
+GROUP BY {pk}
+HAVING COUNT(*) > 1
+)x;
+"""
+
+            out.write(dup_query + "\n")
+03_run_validation.sh
 
 
-import pandas as pd
+#!/bin/bash
 
-df = pd.read_csv("sf_min_max_dates.csv")
+SQL="../generated_sql/validation_queries.sql"
 
-df['schema'] = df['schema'].str.lower()
-df['table'] = df['table'].str.lower()
-df['date_column'] = df['date_column'].str.lower()
+impala-shell -k -i your-host -B -f $SQL \
+> ../output/validation_results.txt \
+2> ../logs/validation.log
 
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-MAX_THREADS = 8
-
-results = []
-def run_query(row):
-
-    schema = row['schema']
-    table = row['table']
-    col = row['date_column']
-    min_date = row['min_date']
-    max_date = row['max_date']
-
-    query = f"""
-    SELECT
-    '{schema}' AS schema,
-    '{table}' AS table,
-    '{col}' AS date_column,
-    '{min_date}' AS min_date,
-    '{max_date}' AS max_date,
-    COUNT({col}) AS record_count
-    FROM prod.{schema}.{table}
-    WHERE {col} BETWEEN '{min_date}' AND '{max_date}'
-    """
-
-    try:
-        df = session.sql(query).to_pandas()
-        res = df.to_dict(orient='records')[0]
-
-        print(f"{schema}.{table} done")
-
-        return res
-
-    except Exception as e:
-        print(f"{schema}.{table} failed")
-        return {
-            "schema":schema,
-            "table":table,
-            "date_column":col,
-            "min_date":min_date,
-            "max_date":max_date,
-            "record_count":"ERROR"
-        }
-
-with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-
-    futures = [executor.submit(run_query, row) for _,row in df.iterrows()]
-
-    for future in as_completed(futures):
-        results.append(future.result())
-
-
-final_df = pd.DataFrame(results)
-
-final_df.head()
+nohup bash scripts/03_run_validation.sh > logs/nohup.log 2>&1 &
