@@ -179,3 +179,220 @@ impala-shell -k -i your-host -B -f $SQL \
 2> ../logs/validation.log
 
 nohup bash scripts/03_run_validation.sh > logs/nohup.log 2>&1 &
+
+
+import csv
+
+INPUT_COLUMNS = "../output/table_columns.psv"
+INPUT_PK = "../input/primary_keys.csv"
+INPUT_NOT_NULL = "../input/not_null_columns.csv"
+
+SQL_OUT = "../generated_sql/validation_queries.sql"
+
+numeric_types = [
+    'int',
+    'bigint',
+    'smallint',
+    'double',
+    'float',
+    'decimal'
+]
+
+tables = {}
+
+# =========================================================
+# READ COLUMN METADATA
+# =========================================================
+with open(INPUT_COLUMNS) as f:
+
+    reader = csv.reader(f, delimiter='|')
+
+    for row in reader:
+
+        if len(row) < 4:
+            continue
+
+        schema, table, col, dtype = row
+
+        schema = schema.lower()
+        table = table.lower()
+        col = col.lower()
+        dtype = dtype.lower()
+
+        key = (schema, table)
+
+        if key not in tables:
+
+            tables[key] = {
+                "numeric": [],
+                "columns": []
+            }
+
+        tables[key]["columns"].append(col)
+
+        # identify numeric columns
+        if any(x in dtype for x in numeric_types):
+            tables[key]["numeric"].append(col)
+
+# =========================================================
+# READ PRIMARY KEYS
+# =========================================================
+pk_map = {}
+
+with open(INPUT_PK) as f:
+
+    next(f)
+
+    for line in f:
+
+        parts = line.strip().split(",")
+
+        if len(parts) < 3:
+            continue
+
+        schema, table, pk = parts
+
+        pk_map[(schema.lower(), table.lower())] = pk.lower()
+
+# =========================================================
+# READ NOT NULL COLUMNS
+# =========================================================
+not_null_map = {}
+
+with open(INPUT_NOT_NULL) as f:
+
+    next(f)
+
+    for line in f:
+
+        parts = line.strip().split(",")
+
+        if len(parts) < 3:
+            continue
+
+        schema, table, col = parts
+
+        key = (schema.lower(), table.lower())
+
+        if key not in not_null_map:
+            not_null_map[key] = []
+
+        not_null_map[key].append(col.lower())
+
+# =========================================================
+# GENERATE VALIDATION SQL
+# =========================================================
+with open(SQL_OUT, "w") as out:
+
+    for key, meta in tables.items():
+
+        schema, table = key
+
+        numeric_cols = meta["numeric"]
+        all_columns = meta["columns"]
+
+        pk = pk_map.get((schema, table))
+
+        not_null_cols = not_null_map.get((schema, table), [])
+
+        select_parts = []
+
+        # -------------------------------------------------
+        # TOTAL COUNT
+        # -------------------------------------------------
+        select_parts.append("COUNT(*) AS total_count")
+
+        # -------------------------------------------------
+        # BUSINESS DATE COLUMN
+        # -------------------------------------------------
+        if "kafka_process_dt" in all_columns:
+            dt_col = "kafka_process_dt"
+
+        elif "ods_business_day" in all_columns:
+            dt_col = "ods_business_day"
+
+        else:
+            dt_col = None
+
+        # -------------------------------------------------
+        # MIN MAX DATE
+        # -------------------------------------------------
+        if dt_col:
+
+            select_parts.append(
+                f"MIN({dt_col}) AS min_date"
+            )
+
+            select_parts.append(
+                f"MAX({dt_col}) AS max_date"
+            )
+
+        # -------------------------------------------------
+        # NUMERIC COLUMN VALIDATIONS
+        # -------------------------------------------------
+        for c in numeric_cols:
+
+            select_parts.append(
+                f"SUM({c}) AS sum_{c}"
+            )
+
+            select_parts.append(
+                f"AVG({c}) AS avg_{c}"
+            )
+
+            select_parts.append(
+                f"MIN({c}) AS min_{c}"
+            )
+
+            select_parts.append(
+                f"MAX({c}) AS max_{c}"
+            )
+
+        # -------------------------------------------------
+        # NOT NULL CHECKS
+        # -------------------------------------------------
+        for c in not_null_cols:
+
+            select_parts.append(
+                f"SUM(CASE WHEN {c} IS NULL THEN 1 ELSE 0 END) AS null_{c}"
+            )
+
+        # -------------------------------------------------
+        # MAIN VALIDATION QUERY
+        # -------------------------------------------------
+        query = f"""
+SELECT
+'{schema}' AS schema_name,
+'{table}' AS table_name,
+{",".join(select_parts)}
+FROM {schema}.{table};
+"""
+
+        out.write(query + "\n")
+
+        # -------------------------------------------------
+        # DUPLICATE CHECK
+        # -------------------------------------------------
+        if pk:
+
+            dup_query = f"""
+SELECT
+'{schema}' AS schema_name,
+'{table}' AS table_name,
+COUNT(*) AS duplicate_count
+FROM
+(
+SELECT
+{pk},
+COUNT(*)
+FROM {schema}.{table}
+GROUP BY {pk}
+HAVING COUNT(*) > 1
+)x;
+"""
+
+            out.write(dup_query + "\n")
+
+print("Validation SQL generated successfully")
+print("Output file :", SQL_OUT)
+
