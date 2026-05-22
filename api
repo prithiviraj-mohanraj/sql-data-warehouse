@@ -1,3 +1,6 @@
+schema|table|column|datatype
+schema,table,date_column,latest_date
+
 scripts/
 │
 ├── generate_numeric_sql.py
