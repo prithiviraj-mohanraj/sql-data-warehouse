@@ -1,5 +1,191 @@
-@Sumathi123 -- sup
-https://zugwdleugnrbubjgdlsb.supabase.co
-sb_publishable_s63x4USUg6aE_WcSKB7CKA_UiUA_Mer
-sb_publishable_s63x4USUg6aE_WcSKB7CKA_UiUA_Mer
-sb_secret_a0pj_p1Mo8PefE-qCu5pUQ_23tzr01d
+scripts/
+│
+├── generate_numeric_sql.py
+├── run_numeric_validation.py
+│
+logs/
+output/
+sql/
+
+generate_numeric_sql.py
+import csv
+
+TABLE_FILE = "input/latest_partition_tables.csv"
+COLUMN_FILE = "input/columns.psv"
+
+SQL_OUT = "sql/numeric_validation.sql"
+
+numeric_types = [
+    'int','bigint','smallint','tinyint',
+    'double','float','decimal','numeric'
+]
+
+# -----------------------------------------
+# read latest partition info
+# -----------------------------------------
+table_info = {}
+
+with open(TABLE_FILE) as f:
+
+    reader = csv.DictReader(f)
+
+    for row in reader:
+
+        key = (row['schema'], row['table'])
+
+        table_info[key] = {
+            'date_column': row['date_column'],
+            'latest_date': row['latest_date']
+        }
+
+# -----------------------------------------
+# generate sql
+# -----------------------------------------
+out = open(SQL_OUT, "w")
+
+with open(COLUMN_FILE) as f:
+
+    for line in f:
+
+        parts = line.strip().split("|")
+
+        if len(parts) < 4:
+            continue
+
+        schema, table, column, datatype = parts[:4]
+
+        datatype = datatype.lower()
+
+        # numeric only
+        if not any(x in datatype for x in numeric_types):
+            continue
+
+        key = (schema, table)
+
+        if key not in table_info:
+            continue
+
+        date_col = table_info[key]['date_column']
+        latest_date = table_info[key]['latest_date']
+
+        sql = f"""
+SELECT
+'{schema}' AS schema_name,
+'{table}' AS table_name,
+'{column}' AS column_name,
+MIN({column}),
+MAX({column}),
+SUM({column}),
+AVG({column}),
+COUNT({column})
+FROM {schema}.{table}
+WHERE {date_col} = '{latest_date}';
+"""
+
+        out.write(sql + "\n")
+
+out.close()
+
+print("SQL generated ->", SQL_OUT)
+
+run_numeric_validation.py
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+SQL_FILE = "sql/numeric_validation.sql"
+
+OUTPUT_FILE = "output/numeric_validation_results.csv"
+
+IMPALA_HOST = "your-host"
+
+MAX_THREADS = 5
+
+# -----------------------------------------
+# read sql queries
+# -----------------------------------------
+queries = []
+
+with open(SQL_FILE) as f:
+
+    current = ""
+
+    for line in f:
+
+        current += line
+
+        if ";" in line:
+            queries.append(current.strip())
+            current = ""
+
+# -----------------------------------------
+# run query
+# -----------------------------------------
+def run_query(idx, query):
+
+    cmd = [
+        "impala-shell",
+        "-k",
+        "-i", IMPALA_HOST,
+        "-B",
+        "-q", query
+    ]
+
+    try:
+
+        result = subprocess.check_output(
+            cmd,
+            stderr=subprocess.DEVNULL
+        )
+
+        output = result.decode().strip().split("\n")[-1]
+
+    except:
+        output = "ERROR"
+
+    print(f"query {idx} completed")
+
+    return idx, output
+
+# -----------------------------------------
+# execute parallel
+# -----------------------------------------
+results = [None] * len(queries)
+
+with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+
+    futures = {
+        executor.submit(run_query, idx, q): idx
+        for idx, q in enumerate(queries)
+    }
+
+    for future in as_completed(futures):
+
+        idx, output = future.result()
+
+        results[idx] = output
+
+# -----------------------------------------
+# write output
+# -----------------------------------------
+with open(OUTPUT_FILE, "w") as f:
+
+    f.write(
+        "schema,table,column,min,max,sum,avg,count\n"
+    )
+
+    for r in results:
+
+        if r:
+            f.write(r.replace("\t", ",") + "\n")
+
+print("Completed ->", OUTPUT_FILE)
+
+python generate_numeric_sql.py
+
+
+nohup python run_numeric_validation.py \
+> logs/numeric_validation.log 2>&1 &
+
+
+tail -f logs/numeric_validation.log
+
