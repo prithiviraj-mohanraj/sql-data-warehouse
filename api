@@ -1,41 +1,51 @@
-generate_numeric_queries.py
-import csv
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# -----------------------------
+# INPUT FILES
+# -----------------------------
 TABLE_FILE="latest_partition.csv"
 COLUMN_FILE="columns.psv"
 
-OUT_SQL="numeric_queries.sql"
+MAX_THREADS=5
 
-numeric_types=[
-'int',
-'bigint',
-'smallint',
-'tinyint',
-'double',
-'float',
-'decimal',
-'numeric'
-]
+# -----------------------------
+# LOAD TABLE INFO
+# -----------------------------
+table_df=pd.read_csv(TABLE_FILE)
 
 table_map={}
 
-# latest partition info
-with open(TABLE_FILE) as f:
+for _,row in table_df.iterrows():
 
-    reader=csv.DictReader(f)
+    key=(row['schema'].lower(),
+         row['table'].lower())
 
-    for row in reader:
+    table_map[key]={
+        'date_column':row['date_column'],
+        'max_date':str(row['max_date'])
+    }
 
-        key=(row['schema'],row['table'])
+# -----------------------------
+# NUMERIC TYPES
+# -----------------------------
+numeric_types=[
+    'int',
+    'bigint',
+    'smallint',
+    'tinyint',
+    'number',
+    'decimal',
+    'numeric',
+    'float',
+    'double'
+]
 
-        table_map[key]={
-            'date_column':row['date_column'],
-            'max_date':row['max_date']
-        }
+queries=[]
 
-out=open(OUT_SQL,'w')
-
-# generate SQL
+# -----------------------------
+# BUILD QUERIES
+# -----------------------------
 with open(COLUMN_FILE) as f:
 
     for line in f:
@@ -46,6 +56,9 @@ with open(COLUMN_FILE) as f:
             continue
 
         schema,table,column,datatype=parts[:4]
+
+        schema=schema.lower()
+        table=table.lower()
 
         datatype=datatype.lower()
 
@@ -60,49 +73,73 @@ with open(COLUMN_FILE) as f:
         date_col=table_map[key]['date_column']
         max_date=table_map[key]['max_date']
 
-        sql=f"""
+        query=f"""
 SELECT
-'{schema}',
-'{table}',
-'{column}',
-MIN({column}),
-MAX({column}),
-SUM({column}),
-AVG({column}),
-COUNT({column})
-FROM {schema}.{table}
-WHERE {date_col}='{max_date}';
+'{schema}' AS schema_name,
+'{table}' AS table_name,
+'{column}' AS column_name,
+MIN({column}) AS min_value,
+MAX({column}) AS max_value,
+SUM({column}) AS sum_value,
+AVG({column}) AS avg_value,
+COUNT({column}) AS count_value
+FROM prod.{schema}.{table}
+WHERE {date_col}='{max_date}'
 """
 
-        out.write(sql+"\n")
+        queries.append(query)
 
-out.close()
+print("Queries generated:",len(queries))
 
-print("SQL generated")
+results=[]
+
+def run_query(query):
+
+    try:
+
+        df=session.sql(query).to_pandas()
+
+        if len(df)>0:
+            return df.iloc[0].to_dict()
+
+    except Exception:
+
+        return None
 
 
-run_numeric_validation.sh
-#!/bin/bash
+with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
 
-IMPALA_HOST="your-host"
+    futures=[
+        executor.submit(run_query,q)
+        for q in queries
+    ]
 
-SQL_FILE="numeric_queries.sql"
+    completed=0
 
-OUTPUT_FILE="numeric_results.csv"
+    for future in as_completed(futures):
 
-echo "schema,table,column,min,max,sum,avg,count" > $OUTPUT_FILE
+        result=future.result()
 
-impala-shell \
--k \
--i $IMPALA_HOST \
--B \
--f $SQL_FILE 2>/dev/null |
-awk -F'\t' '
-NF>=8{
-print $1","$2","$3","$4","$5","$6","$7","$8
-}
-' >> $OUTPUT_FILE
+        if result:
+            results.append(result)
 
-echo "Completed"
+        completed+=1
 
-nohup bash run_numeric_validation.sh > logs/numeric.log 2>&1 &
+        if completed%100==0:
+            print(f"{completed} queries completed")
+
+sf_numeric_results=pd.DataFrame(results)
+
+sf_numeric_results.to_csv(
+    "snowflake_numeric_results.csv",
+    index=False
+)
+
+print("Completed")
+print("Rows:",len(sf_numeric_results))
+
+compare=cloudera_df.merge(
+    sf_numeric_results,
+    on=['schema','table','column'],
+    suffixes=('_cloudera','_snowflake')
+)
