@@ -1,276 +1,108 @@
-# =========================================================
-# FILE NAME : generate_numeric_validation_sql.py
-#
-# PURPOSE:
-# Generate SQL dynamically for ALL NUMERIC COLUMNS
-# for latest partition date only.
-#
-# OUTPUT:
-# sql/<schema>_<table>.sql
-#
-# INPUT FILE 1:
-# latest_partition_tables.csv
-#
-# schema,table,date_column,latest_date
-#
-# INPUT FILE 2:
-# columns.psv
-#
-# schema|table|column|datatype
-#
-# =========================================================
-
+generate_numeric_queries.py
 import csv
-import os
 
-# =========================================================
-# INPUT FILES
-# =========================================================
+TABLE_FILE="latest_partition.csv"
+COLUMN_FILE="columns.psv"
 
-TABLE_FILE = "latest_partition_tables.csv"
-COLUMN_FILE = "columns.psv"
+OUT_SQL="numeric_queries.sql"
 
-# =========================================================
-# OUTPUT SQL DIRECTORY
-# =========================================================
-
-SQL_DIR = "sql"
-
-os.makedirs(SQL_DIR, exist_ok=True)
-
-# =========================================================
-# NUMERIC TYPES
-# =========================================================
-
-NUMERIC_TYPES = [
-    "int",
-    "bigint",
-    "smallint",
-    "tinyint",
-    "double",
-    "float",
-    "decimal",
-    "numeric"
+numeric_types=[
+'int',
+'bigint',
+'smallint',
+'tinyint',
+'double',
+'float',
+'decimal',
+'numeric'
 ]
 
-# =========================================================
-# READ TABLE + LATEST PARTITION INFO
-# =========================================================
+table_map={}
 
-table_info = {}
-
+# latest partition info
 with open(TABLE_FILE) as f:
 
-    reader = csv.DictReader(f)
+    reader=csv.DictReader(f)
 
     for row in reader:
 
-        schema = row["schema"].strip().lower()
-        table = row["table"].strip().lower()
+        key=(row['schema'],row['table'])
 
-        table_info[(schema, table)] = {
-            "date_column": row["date_column"].strip(),
-            "latest_date": row["latest_date"].strip()
+        table_map[key]={
+            'date_column':row['date_column'],
+            'max_date':row['max_date']
         }
 
-# =========================================================
-# GENERATE SQL PER TABLE
-# =========================================================
+out=open(OUT_SQL,'w')
 
-table_queries = {}
-
+# generate SQL
 with open(COLUMN_FILE) as f:
 
     for line in f:
 
-        parts = line.strip().split("|")
+        parts=line.strip().split("|")
 
-        if len(parts) < 4:
+        if len(parts)<4:
             continue
 
-        schema = parts[0].strip().lower()
-        table = parts[1].strip().lower()
-        column = parts[2].strip().lower()
-        datatype = parts[3].strip().lower()
+        schema,table,column,datatype=parts[:4]
 
-        # -------------------------------------------------
-        # ONLY NUMERIC COLUMNS
-        # -------------------------------------------------
+        datatype=datatype.lower()
 
-        if not any(x in datatype for x in NUMERIC_TYPES):
+        if not any(x in datatype for x in numeric_types):
             continue
 
-        key = (schema, table)
+        key=(schema,table)
 
-        # -------------------------------------------------
-        # TABLE MUST EXIST IN LATEST PARTITION FILE
-        # -------------------------------------------------
-
-        if key not in table_info:
+        if key not in table_map:
             continue
 
-        date_column = table_info[key]["date_column"]
-        latest_date = table_info[key]["latest_date"]
+        date_col=table_map[key]['date_column']
+        max_date=table_map[key]['max_date']
 
-        # -------------------------------------------------
-        # SQL QUERY
-        # -------------------------------------------------
-
-        query = f"""
+        sql=f"""
 SELECT
-'{schema}' AS schema_name,
-'{table}' AS table_name,
-'{column}' AS column_name,
-MIN({column}) AS min_value,
-MAX({column}) AS max_value,
-SUM({column}) AS sum_value,
-AVG({column}) AS avg_value,
-COUNT({column}) AS count_value
+'{schema}',
+'{table}',
+'{column}',
+MIN({column}),
+MAX({column}),
+SUM({column}),
+AVG({column}),
+COUNT({column})
 FROM {schema}.{table}
-WHERE {date_column} = '{latest_date}';
+WHERE {date_col}='{max_date}';
 """
 
-        if key not in table_queries:
-            table_queries[key] = []
+        out.write(sql+"\n")
 
-        table_queries[key].append(query)
+out.close()
 
-# =========================================================
-# WRITE SQL FILES
-# =========================================================
+print("SQL generated")
 
-for key, queries in table_queries.items():
 
-    schema, table = key
+run_numeric_validation.sh
+#!/bin/bash
 
-    sql_file = f"{SQL_DIR}/{schema}_{table}.sql"
+IMPALA_HOST="your-host"
 
-    with open(sql_file, "w") as out:
+SQL_FILE="numeric_queries.sql"
 
-        for q in queries:
-            out.write(q + "\n")
+OUTPUT_FILE="numeric_results.csv"
 
-print("====================================")
-print("SQL FILES GENERATED")
-print("====================================")
-print("OUTPUT DIRECTORY :", SQL_DIR)
-print("====================================")
+echo "schema,table,column,min,max,sum,avg,count" > $OUTPUT_FILE
 
-# =========================================================
-# FILE NAME : run_numeric_validation_parallel.py
-#
-# PURPOSE:
-# Execute generated SQL files in parallel
-# using 5 threads.
-#
-# OUTPUT:
-# numeric_validation_output.csv
-#
-# =========================================================
+impala-shell \
+-k \
+-i $IMPALA_HOST \
+-B \
+-f $SQL_FILE 2>/dev/null |
+awk -F'\t' '
+NF>=8{
+print $1","$2","$3","$4","$5","$6","$7","$8
+}
+' >> $OUTPUT_FILE
 
-import subprocess
-import glob
-from concurrent.futures import ThreadPoolExecutor, as_completed
+echo "Completed"
 
-# =========================================================
-# CONFIG
-# =========================================================
-
-IMPALA_HOST = "your-host"
-
-SQL_DIR = "sql"
-
-OUTPUT_FILE = "numeric_validation_output.csv"
-
-MAX_THREADS = 5
-
-# =========================================================
-# GET SQL FILES
-# =========================================================
-
-sql_files = glob.glob(f"{SQL_DIR}/*.sql")
-
-# =========================================================
-# RUN SQL FILE
-# =========================================================
-
-def run_sql_file(sql_file):
-
-    cmd = [
-        "impala-shell",
-        "-k",
-        "-i", IMPALA_HOST,
-        "-B",
-        "-f", sql_file
-    ]
-
-    try:
-
-        result = subprocess.check_output(
-            cmd,
-            stderr=subprocess.DEVNULL
-        )
-
-        lines = result.decode().strip().split("\n")
-
-        output_rows = []
-
-        for line in lines:
-
-            cols = line.split("\t")
-
-            if len(cols) >= 8:
-
-                output_rows.append(",".join(cols[:8]))
-
-        print(f"{sql_file} completed")
-
-        return output_rows
-
-    except Exception as e:
-
-        print(f"{sql_file} failed")
-
-        return []
-
-# =========================================================
-# EXECUTE IN PARALLEL
-# =========================================================
-
-all_results = []
-
-with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-
-    futures = {
-        executor.submit(run_sql_file, sql_file): sql_file
-        for sql_file in sql_files
-    }
-
-    for future in as_completed(futures):
-
-        rows = future.result()
-
-        all_results.extend(rows)
-
-# =========================================================
-# WRITE FINAL OUTPUT
-# =========================================================
-
-with open(OUTPUT_FILE, "w") as out:
-
-    out.write(
-        "schema_name,table_name,column_name,min_value,max_value,sum_value,avg_value,count_value\n"
-    )
-
-    for row in all_results:
-        out.write(row + "\n")
-
-print("====================================")
-print("VALIDATION COMPLETED")
-print("====================================")
-print("OUTPUT FILE :", OUTPUT_FILE)
-print("====================================")
-
-python generate_numeric_validation_sql.py
-nohup python run_numeric_validation_parallel.py \
-> numeric_validation.log 2>&1 &
+nohup bash run_numeric_validation.sh > logs/numeric.log 2>&1 &
