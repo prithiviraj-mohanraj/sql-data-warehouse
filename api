@@ -25,6 +25,17 @@ runs/
 logs/
 
 
+
+validation/
+
+input/
+    input_tables.csv
+
+scripts/
+    extract_columns.sh
+    generate_numeric_sql.py
+    run_validation.sh
+
 scripts/run_validation.sh
 #!/bin/bash
 
