@@ -1,51 +1,165 @@
-import pandas as pd
-from concurrent.futures import ThreadPoolExecutor, as_completed
+input/input_tables.csv
 
-# -----------------------------
-# INPUT FILES
-# -----------------------------
-TABLE_FILE="latest_partition.csv"
-COLUMN_FILE="columns.psv"
+schema,table,date_column
+sl1_sales,orders_h,ods_business_day
+sl1_stream,events_t2,kafka_process_dt
 
-MAX_THREADS=5
 
-# -----------------------------
-# LOAD TABLE INFO
-# -----------------------------
-table_df=pd.read_csv(TABLE_FILE)
+input/columns.psv
+
+schema|table|column|datatype
+
+
+
+validation/
+
+input/
+    input_tables.csv
+    columns.psv
+
+scripts/
+    generate_numeric_sql.py
+    run_validation.sh
+
+runs/
+logs/
+
+
+scripts/run_validation.sh
+#!/bin/bash
+
+IMPALA_HOST="your-host"
+
+RUN_NUM=$(printf "%03d" $(( $(ls runs 2>/dev/null | wc -l)+1 )))
+
+RUN_ID="run_${RUN_NUM}"
+
+RUN_DIR="runs/${RUN_ID}"
+
+mkdir -p ${RUN_DIR}
+
+echo "=================================="
+echo "Starting ${RUN_ID}"
+echo "=================================="
+
+# ---------------------------------------
+# Step 1 : Extract columns
+# ---------------------------------------
+
+echo "Running column extraction..."
+
+bash scripts/extract_columns.sh
+
+if [ ! -f columns.psv ]; then
+    echo "columns.psv not generated"
+    exit 1
+fi
+
+cp input/input_tables.csv ${RUN_DIR}/
+
+mv columns.psv ${RUN_DIR}/columns.psv
+
+# ---------------------------------------
+# Step 2 : Generate SQL
+# ---------------------------------------
+
+echo "Generating SQL..."
+
+python scripts/generate_numeric_sql.py \
+    input/input_tables.csv \
+    ${RUN_DIR}/columns.psv \
+    ${RUN_DIR}/numeric_queries.sql
+
+# ---------------------------------------
+# Step 3 : Execute SQL
+# ---------------------------------------
+
+OUTPUT_FILE="${RUN_DIR}/numeric_results.csv"
+
+echo "schema,table,partition_column,latest_partition,column,min,max,sum,avg,count" \
+> ${OUTPUT_FILE}
+
+echo "Executing SQL..."
+
+impala-shell \
+-k \
+-i ${IMPALA_HOST} \
+-B \
+-f ${RUN_DIR}/numeric_queries.sql \
+2>/dev/null |
+awk -F'\t' '
+NF>=10{
+print $1","$2","$3","$4","$5","$6","$7","$8","$9","$10
+}
+' >> ${OUTPUT_FILE}
+
+# ---------------------------------------
+# Step 4 : Summary
+# ---------------------------------------
+
+TABLE_COUNT=$(($(wc -l < input/input_tables.csv)-1))
+
+COLUMN_COUNT=$(wc -l < ${RUN_DIR}/columns.psv)
+
+QUERY_COUNT=$(grep -c "^SELECT" ${RUN_DIR}/numeric_queries.sql)
+
+cat > ${RUN_DIR}/summary.txt << EOF
+Run ID              : ${RUN_ID}
+
+Input File          : input_tables.csv
+
+Tables Input        : ${TABLE_COUNT}
+
+Columns Extracted   : ${COLUMN_COUNT}
+
+Queries Generated   : ${QUERY_COUNT}
+
+Results File        : numeric_results.csv
+
+SQL File            : numeric_queries.sql
+EOF
+
+echo "Completed ${RUN_ID}"
+
+
+scripts/generate_numeric_sql.py
+import csv
+import sys
+
+TABLE_FILE=sys.argv[1]
+COLUMN_FILE=sys.argv[2]
+OUT_SQL=sys.argv[3]
+
+numeric_types=[
+'int',
+'bigint',
+'smallint',
+'tinyint',
+'double',
+'float',
+'decimal',
+'numeric'
+]
 
 table_map={}
 
-for _,row in table_df.iterrows():
+with open(TABLE_FILE) as f:
 
-    key=(row['schema'].lower(),
-         row['table'].lower())
+    reader=csv.DictReader(f)
 
-    table_map[key]={
-        'date_column':row['date_column'],
-        'max_date':str(row['max_date'])
-    }
+    for row in reader:
 
-# -----------------------------
-# NUMERIC TYPES
-# -----------------------------
-numeric_types=[
-    'int',
-    'bigint',
-    'smallint',
-    'tinyint',
-    'number',
-    'decimal',
-    'numeric',
-    'float',
-    'double'
-]
+        key=(
+            row['schema'].strip().lower(),
+            row['table'].strip().lower()
+        )
 
-queries=[]
+        table_map[key]={
+            'date_column':row['date_column'].strip()
+        }
 
-# -----------------------------
-# BUILD QUERIES
-# -----------------------------
+out=open(OUT_SQL,'w')
+
 with open(COLUMN_FILE) as f:
 
     for line in f:
@@ -71,75 +185,49 @@ with open(COLUMN_FILE) as f:
             continue
 
         date_col=table_map[key]['date_column']
-        max_date=table_map[key]['max_date']
 
-        query=f"""
+        sql=f"""
 SELECT
-'{schema}' AS schema_name,
-'{table}' AS table_name,
-'{column}' AS column_name,
-MIN({column}) AS min_value,
-MAX({column}) AS max_value,
-SUM({column}) AS sum_value,
-AVG({column}) AS avg_value,
-COUNT({column}) AS count_value
-FROM prod.{schema}.{table}
-WHERE {date_col}='{max_date}'
+'{schema}',
+'{table}',
+'{date_col}',
+(
+SELECT MAX({date_col})
+FROM {schema}.{table}
+),
+'{column}',
+MIN({column}),
+MAX({column}),
+SUM(
+CASE
+WHEN ABS({column}) <= 9999999999
+THEN {column}
+END
+),
+AVG(
+CASE
+WHEN ABS({column}) <= 9999999999
+THEN {column}
+END
+),
+COUNT({date_col})
+FROM {schema}.{table}
+WHERE {date_col}=
+(
+SELECT MAX({date_col})
+FROM {schema}.{table}
+);
+
 """
 
-        queries.append(query)
+        out.write(sql)
 
-print("Queries generated:",len(queries))
+out.close()
 
-results=[]
+print("SQL generated ->",OUT_SQL)
 
-def run_query(query):
+nohup bash scripts/run_validation.sh \
+> logs/run.log 2>&1 &
 
-    try:
+tail -f logs/run.log
 
-        df=session.sql(query).to_pandas()
-
-        if len(df)>0:
-            return df.iloc[0].to_dict()
-
-    except Exception:
-
-        return None
-
-
-with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-
-    futures=[
-        executor.submit(run_query,q)
-        for q in queries
-    ]
-
-    completed=0
-
-    for future in as_completed(futures):
-
-        result=future.result()
-
-        if result:
-            results.append(result)
-
-        completed+=1
-
-        if completed%100==0:
-            print(f"{completed} queries completed")
-
-sf_numeric_results=pd.DataFrame(results)
-
-sf_numeric_results.to_csv(
-    "snowflake_numeric_results.csv",
-    index=False
-)
-
-print("Completed")
-print("Rows:",len(sf_numeric_results))
-
-compare=cloudera_df.merge(
-    sf_numeric_results,
-    on=['schema','table','column'],
-    suffixes=('_cloudera','_snowflake')
-)
